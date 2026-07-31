@@ -19,7 +19,7 @@
 //!
 //! This module contains all request structures used in REST API calls.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
 use crate::{
@@ -167,6 +167,65 @@ impl AlterTableRequest {
     }
 }
 
+/// Request to create table partitions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePartitionsRequest {
+    /// Partition specs to register.
+    pub partition_specs: Vec<HashMap<String, String>>,
+    /// Whether already registered partitions should be ignored.
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_null_to_true"
+    )]
+    pub ignore_if_exists: bool,
+}
+
+impl CreatePartitionsRequest {
+    /// Create a request to register partitions.
+    pub fn new(partition_specs: Vec<HashMap<String, String>>, ignore_if_exists: bool) -> Self {
+        Self {
+            partition_specs,
+            ignore_if_exists,
+        }
+    }
+}
+
+/// Request to drop (unregister) table partitions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DropPartitionsRequest {
+    /// Partition specs to unregister.
+    pub partition_specs: Vec<HashMap<String, String>>,
+    /// Whether missing partitions should be ignored.
+    #[serde(
+        default = "default_true",
+        deserialize_with = "deserialize_null_to_true"
+    )]
+    pub ignore_if_not_exists: bool,
+}
+
+impl DropPartitionsRequest {
+    /// Create a request to unregister partitions.
+    pub fn new(partition_specs: Vec<HashMap<String, String>>, ignore_if_not_exists: bool) -> Self {
+        Self {
+            partition_specs,
+            ignore_if_not_exists,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn deserialize_null_to_true<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<bool>::deserialize(deserializer)?.unwrap_or(true))
+}
+
 /// Request for auth table query: the projected columns of the query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthTableQueryRequest {
@@ -218,6 +277,65 @@ mod tests {
         // `None` omits the key entirely (matches the server's optional field).
         let req = AuthTableQueryRequest::new(None);
         assert_eq!(serde_json::to_string(&req).unwrap(), "{}");
+    }
+
+    #[test]
+    fn test_create_partitions_request_serialization() {
+        let req = CreatePartitionsRequest::new(
+            vec![HashMap::from([
+                ("dt".to_string(), "2026-07-22".to_string()),
+                ("hour".to_string(), "10".to_string()),
+            ])],
+            false,
+        );
+
+        assert_eq!(
+            serde_json::to_value(req).unwrap(),
+            serde_json::json!({
+                "partitionSpecs": [{
+                    "dt": "2026-07-22",
+                    "hour": "10"
+                }],
+                "ignoreIfExists": false
+            })
+        );
+    }
+
+    #[test]
+    fn test_drop_partitions_request_serialization() {
+        let req = DropPartitionsRequest::new(
+            vec![HashMap::from([(
+                "dt".to_string(),
+                "2026-07-22".to_string(),
+            )])],
+            false,
+        );
+
+        assert_eq!(
+            serde_json::to_value(req).unwrap(),
+            serde_json::json!({
+                "partitionSpecs": [{"dt": "2026-07-22"}],
+                "ignoreIfNotExists": false
+            })
+        );
+    }
+
+    #[test]
+    fn test_partition_request_flags_default_to_true() {
+        for json in [
+            serde_json::json!({"partitionSpecs": []}),
+            serde_json::json!({"partitionSpecs": [], "ignoreIfExists": null}),
+        ] {
+            let request: CreatePartitionsRequest = serde_json::from_value(json).unwrap();
+            assert!(request.ignore_if_exists);
+        }
+        for json in [
+            serde_json::json!({"partitionSpecs": []}),
+            serde_json::json!({"partitionSpecs": [], "ignoreIfNotExists": null}),
+        ] {
+            let request: DropPartitionsRequest = serde_json::from_value(json).unwrap();
+            assert!(request.ignore_if_not_exists);
+        }
     }
 
     #[test]

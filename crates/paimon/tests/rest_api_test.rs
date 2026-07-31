@@ -24,7 +24,7 @@ use std::collections::HashMap;
 
 use paimon::api::auth::{DLFECSTokenLoader, DLFToken, DLFTokenLoader};
 use paimon::api::rest_api::RESTApi;
-use paimon::api::ConfigResponse;
+use paimon::api::{ConfigResponse, CreatePartitionsRequest, DropPartitionsRequest};
 use paimon::catalog::{Function, FunctionDefinition, Identifier, ViewSchema};
 use paimon::common::Options;
 use paimon::spec::DataField;
@@ -69,6 +69,13 @@ async fn setup_test_server(initial_dbs: Vec<&str>) -> TestContext {
         .expect("Failed to create RESTApi");
 
     TestContext { server, api, url }
+}
+
+async fn setup_partition_api() -> (TestContext, Identifier) {
+    let ctx = setup_test_server(vec!["default"]).await;
+    let identifier = Identifier::new("default", "managed_table");
+    ctx.server.add_table("default", "managed_table");
+    (ctx, identifier)
 }
 
 // ==================== Database Tests ====================
@@ -592,6 +599,142 @@ async fn test_drop_table_no_permission() {
         .drop_table(&Identifier::new("default", "secret_table"))
         .await;
     assert!(result.is_err(), "dropping no-permission table should fail");
+}
+
+// ==================== Partition Tests ====================
+
+#[tokio::test]
+async fn test_partition_mutations_post_expected_requests() {
+    let (ctx, identifier) = setup_partition_api().await;
+    let partition_specs = vec![HashMap::from([
+        ("dt".to_string(), "2026-07-22".to_string()),
+        ("hour".to_string(), "10".to_string()),
+    ])];
+
+    ctx.api
+        .create_partitions(&identifier, partition_specs.clone(), false)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ctx.server.create_partitions_calls(),
+        vec![(
+            "default".to_string(),
+            "managed_table".to_string(),
+            CreatePartitionsRequest::new(partition_specs.clone(), false),
+        )]
+    );
+
+    ctx.api
+        .drop_partitions(&identifier, partition_specs.clone(), false)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ctx.server.drop_partitions_calls(),
+        vec![(
+            "default".to_string(),
+            "managed_table".to_string(),
+            DropPartitionsRequest::new(partition_specs, false),
+        )]
+    );
+}
+
+#[tokio::test]
+async fn test_list_partitions_follows_non_empty_token_after_empty_page() {
+    let (ctx, identifier) = setup_partition_api().await;
+    let expected = HashMap::from([("dt".to_string(), "2026-07-22".to_string())]);
+    ctx.server.set_table_partition_page_responses(
+        "default",
+        "managed_table",
+        vec![
+            (Vec::new(), Some("1".to_string())),
+            (vec![expected.clone()], None),
+        ],
+    );
+
+    let partitions = ctx.api.list_partitions(&identifier).await.unwrap();
+
+    assert_eq!(partitions.len(), 1);
+    assert_eq!(partitions[0].spec, expected);
+}
+
+#[tokio::test]
+async fn test_list_partitions_stops_on_empty_next_page_token() {
+    let (ctx, identifier) = setup_partition_api().await;
+    let expected = HashMap::from([("dt".to_string(), "2026-07-22".to_string())]);
+    let unexpected = HashMap::from([("dt".to_string(), "2026-07-23".to_string())]);
+    ctx.server.set_table_partition_page_responses(
+        "default",
+        "managed_table",
+        vec![
+            (vec![expected.clone()], Some(String::new())),
+            (vec![unexpected], None),
+        ],
+    );
+
+    let partitions = ctx.api.list_partitions(&identifier).await.unwrap();
+
+    assert_eq!(
+        partitions
+            .into_iter()
+            .map(|partition| partition.spec)
+            .collect::<Vec<_>>(),
+        vec![expected]
+    );
+    assert_eq!(
+        ctx.server
+            .table_partition_list_call_count("default", "managed_table"),
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_list_partitions_rejects_repeated_page_token() {
+    let (ctx, identifier) = setup_partition_api().await;
+    ctx.server.set_table_partition_page_responses(
+        "default",
+        "managed_table",
+        vec![
+            (
+                vec![HashMap::from([(
+                    "dt".to_string(),
+                    "2026-07-20".to_string(),
+                )])],
+                Some("a".to_string()),
+            ),
+            (
+                vec![HashMap::from([(
+                    "dt".to_string(),
+                    "2026-07-21".to_string(),
+                )])],
+                Some("b".to_string()),
+            ),
+            (
+                vec![HashMap::from([(
+                    "dt".to_string(),
+                    "2026-07-22".to_string(),
+                )])],
+                Some("a".to_string()),
+            ),
+        ],
+    );
+
+    let error = ctx.api.list_partitions(&identifier).await.unwrap_err();
+
+    let paimon::Error::UnexpectedError { message, .. } = error else {
+        panic!("expected a repeated-page-token error, got: {error}");
+    };
+    assert_eq!(
+        message,
+        "REST catalog returned partition page token 'a' more than once for table \
+         default.managed_table"
+    );
+    assert_eq!(
+        ctx.server
+            .table_partition_list_call_count("default", "managed_table"),
+        3
+    );
 }
 
 // ==================== Rename Table Tests ====================

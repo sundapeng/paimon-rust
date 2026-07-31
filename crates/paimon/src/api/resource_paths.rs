@@ -216,6 +216,11 @@ impl ResourcePaths {
             Self::PARTITIONS
         )
     }
+
+    /// Get the endpoint path for dropping table partitions.
+    pub fn drop_partitions(&self, database_name: &str, table_name: &str) -> String {
+        format!("{}/drop", self.partitions(database_name, table_name))
+    }
 }
 
 #[cfg(test)]
@@ -294,6 +299,15 @@ mod tests {
         assert_eq!(
             paths.function("analytics", "rectangle area"),
             "/v1/catalog/databases/analytics/functions/rectangle+area"
+        );
+    }
+
+    #[test]
+    fn test_drop_partitions_path_encodes_names() {
+        let paths = ResourcePaths::new("catalog");
+        assert_eq!(
+            paths.drop_partitions("analytics db", "user events"),
+            "/v1/catalog/databases/analytics+db/tables/user+events/partitions/drop"
         );
     }
 }

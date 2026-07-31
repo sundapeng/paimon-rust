@@ -35,12 +35,16 @@ use tokio::task::JoinHandle;
 
 use paimon::api::{
     AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, ConfigResponse,
-    CreateFunctionRequest, CreateViewRequest, ErrorResponse, GetDatabaseResponse,
-    GetFunctionResponse, GetTableResponse, GetViewResponse, ListDatabasesResponse,
-    ListFunctionsResponse, ListTablesResponse, ListViewsResponse, RenameTableRequest,
-    ResourcePaths,
+    CreateFunctionRequest, CreatePartitionsRequest, CreateViewRequest, DropPartitionsRequest,
+    ErrorResponse, GetDatabaseResponse, GetFunctionResponse, GetTableResponse, GetViewResponse,
+    ListDatabasesResponse, ListFunctionsResponse, ListPartitionsResponse, ListTablesResponse,
+    ListViewsResponse, RenameTableRequest, ResourcePaths,
 };
 use paimon::catalog::{Function, Identifier};
+use paimon::spec::Partition;
+
+type PartitionPageResponse = (Vec<Partition>, Option<String>);
+type PartitionSpecPageResponse = (Vec<HashMap<String, String>>, Option<String>);
 
 #[derive(Clone, Debug, Default)]
 struct MockState {
@@ -48,15 +52,58 @@ struct MockState {
     tables: HashMap<String, GetTableResponse>,
     views: HashMap<String, GetViewResponse>,
     functions: HashMap<String, GetFunctionResponse>,
+    partitions: HashMap<String, Vec<Partition>>,
+    partition_page_responses: HashMap<String, Vec<PartitionPageResponse>>,
+    partition_list_call_counts: HashMap<String, usize>,
+    partition_list_name_patterns: HashMap<String, Vec<Option<String>>>,
     view_function_endpoints_unsupported: bool,
     drop_view_error_status: Option<StatusCode>,
     list_page_size: Option<usize>,
     no_permission_databases: HashSet<String>,
     no_permission_tables: HashSet<String>,
+    create_partitions_calls: Vec<(String, String, CreatePartitionsRequest)>,
+    drop_partitions_calls: Vec<(String, String, DropPartitionsRequest)>,
+    create_partitions_error_status: Option<StatusCode>,
+    list_partitions_error_status: Option<StatusCode>,
     /// ECS metadata role name (for token loader testing)
     ecs_role_name: Option<String>,
     /// ECS metadata token (for token loader testing)
     ecs_token: Option<serde_json::Value>,
+}
+
+/// Match a partition spec against a partition-name pattern the way a catalog would.
+///
+/// Only the pattern shape clients send is understood: `key=value` segments joined by `/`,
+/// optionally ending in a `/%` wildcard. Values are compared unescaped, so a test that
+/// needs escaping should assert the pattern the client sent instead of the rows returned.
+fn partition_spec_matches_name_pattern(spec: &HashMap<String, String>, pattern: &str) -> bool {
+    let prefix = pattern.strip_suffix("/%");
+    let segments = prefix.unwrap_or(pattern).split('/').collect::<Vec<_>>();
+    if prefix.is_none() && segments.len() != spec.len() {
+        return false;
+    }
+    segments.iter().all(|segment| {
+        segment
+            .split_once('=')
+            .is_some_and(|(key, value)| spec.get(key).map(String::as_str) == Some(value))
+    })
+}
+
+fn partition_from_spec(spec: HashMap<String, String>) -> Partition {
+    Partition {
+        spec,
+        record_count: 0,
+        file_size_in_bytes: 0,
+        file_count: 0,
+        last_file_creation_time: 0,
+        total_buckets: 0,
+        done: false,
+        created_at: None,
+        created_by: None,
+        updated_at: None,
+        updated_by: None,
+        options: None,
+    }
 }
 
 fn paginate_names(
@@ -282,6 +329,11 @@ impl RESTServer {
             // Also remove all tables in this database
             let prefix = format!("{name}.");
             s.tables.retain(|key, _| !key.starts_with(&prefix));
+            s.partitions.retain(|key, _| !key.starts_with(&prefix));
+            s.partition_page_responses
+                .retain(|key, _| !key.starts_with(&prefix));
+            s.partition_list_call_counts
+                .retain(|key, _| !key.starts_with(&prefix));
             s.no_permission_tables
                 .retain(|key| !key.starts_with(&prefix));
             (StatusCode::OK, Json(serde_json::json!(""))).into_response()
@@ -724,6 +776,9 @@ impl RESTServer {
         }
 
         if s.tables.remove(&key).is_some() {
+            s.partitions.remove(&key);
+            s.partition_page_responses.remove(&key);
+            s.partition_list_call_counts.remove(&key);
             s.no_permission_tables.remove(&key);
             (StatusCode::OK, Json(serde_json::json!(""))).into_response()
         } else {
@@ -769,6 +824,200 @@ impl RESTServer {
             );
             (StatusCode::NOT_FOUND, Json(err)).into_response()
         }
+    }
+
+    /// Handle POST /databases/:db/tables/:table/partitions - create partitions.
+    pub async fn create_partitions(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(request): Json<CreatePartitionsRequest>,
+    ) -> impl IntoResponse {
+        let mut inner = state.inner.lock().unwrap();
+        inner
+            .create_partitions_calls
+            .push((db.clone(), table.clone(), request.clone()));
+        if let Some(status) = inner.create_partitions_error_status {
+            let message = if status == StatusCode::CONFLICT {
+                "Some partitions already exist"
+            } else {
+                "Invalid partition request"
+            };
+            let error = ErrorResponse::new(
+                Some("partition".to_string()),
+                Some(table.clone()),
+                Some(message.to_string()),
+                Some(status.as_u16() as i32),
+            );
+            return (status, Json(error)).into_response();
+        }
+
+        let key = format!("{db}.{table}");
+        if !inner.tables.contains_key(&key) {
+            let error = ErrorResponse::new(
+                Some("table".to_string()),
+                Some(table),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            return (StatusCode::NOT_FOUND, Json(error)).into_response();
+        }
+
+        let registered_partitions = inner.partitions.entry(key).or_default();
+        let has_conflict = request
+            .partition_specs
+            .iter()
+            .enumerate()
+            .any(|(index, spec)| {
+                registered_partitions
+                    .iter()
+                    .any(|partition| partition.spec == *spec)
+                    || request.partition_specs[..index].contains(spec)
+            });
+        if has_conflict && !request.ignore_if_exists {
+            let error = ErrorResponse::new(
+                Some("partition".to_string()),
+                Some(table),
+                Some("Some partitions already exist".to_string()),
+                Some(StatusCode::CONFLICT.as_u16() as i32),
+            );
+            return (StatusCode::CONFLICT, Json(error)).into_response();
+        }
+
+        for spec in request.partition_specs {
+            if !registered_partitions
+                .iter()
+                .any(|partition| partition.spec == spec)
+            {
+                registered_partitions.push(partition_from_spec(spec));
+            }
+        }
+        let response = json!({"success": true});
+        (StatusCode::OK, Json(response)).into_response()
+    }
+
+    /// Handle GET /databases/:db/tables/:table/partitions - list partitions.
+    pub async fn list_partitions(
+        Path((db, table)): Path<(String, String)>,
+        Query(params): Query<HashMap<String, String>>,
+        Extension(state): Extension<Arc<RESTServer>>,
+    ) -> impl IntoResponse {
+        let mut inner = state.inner.lock().unwrap();
+        let key = format!("{db}.{table}");
+        let name_pattern = params.get("partitionNamePattern").cloned();
+        inner
+            .partition_list_name_patterns
+            .entry(key.clone())
+            .or_default()
+            .push(name_pattern.clone());
+        if !inner.tables.contains_key(&key) {
+            let error = ErrorResponse::new(
+                Some("table".to_string()),
+                Some(table),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            return (StatusCode::NOT_FOUND, Json(error)).into_response();
+        }
+        if let Some(status) = inner.list_partitions_error_status {
+            let error = ErrorResponse::new(
+                Some("partition".to_string()),
+                Some(table),
+                Some("Partition listing is not implemented".to_string()),
+                Some(status.as_u16() as i32),
+            );
+            return (status, Json(error)).into_response();
+        }
+        if inner.partition_page_responses.contains_key(&key) {
+            let request_index = {
+                let calls = inner
+                    .partition_list_call_counts
+                    .entry(key.clone())
+                    .or_default();
+                let request_index = *calls;
+                *calls += 1;
+                request_index
+            };
+            let responses = &inner.partition_page_responses[&key];
+            let expected_token = request_index
+                .checked_sub(1)
+                .and_then(|index| responses.get(index))
+                .and_then(|(_, token)| token.clone());
+            let actual_token = params.get("pageToken").cloned();
+            if actual_token != expected_token || request_index >= responses.len() {
+                let error = ErrorResponse::new(
+                    Some("partition".to_string()),
+                    Some(table),
+                    Some(format!(
+                        "Invalid page token: expected {expected_token:?}, got {actual_token:?}"
+                    )),
+                    Some(StatusCode::BAD_REQUEST.as_u16() as i32),
+                );
+                return (StatusCode::BAD_REQUEST, Json(error)).into_response();
+            }
+            let (partitions, next_page_token) = responses[request_index].clone();
+            return (
+                StatusCode::OK,
+                Json(ListPartitionsResponse::new(
+                    Some(partitions),
+                    next_page_token,
+                )),
+            )
+                .into_response();
+        }
+        let mut partitions = inner.partitions.get(&key).cloned().unwrap_or_default();
+        if let Some(pattern) = name_pattern {
+            partitions
+                .retain(|partition| partition_spec_matches_name_pattern(&partition.spec, &pattern));
+        }
+        (
+            StatusCode::OK,
+            Json(ListPartitionsResponse::new(Some(partitions), None)),
+        )
+            .into_response()
+    }
+
+    /// Handle POST /databases/:db/tables/:table/partitions/drop - drop partitions.
+    pub async fn drop_partitions(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(request): Json<DropPartitionsRequest>,
+    ) -> impl IntoResponse {
+        let mut inner = state.inner.lock().unwrap();
+        inner
+            .drop_partitions_calls
+            .push((db.clone(), table.clone(), request.clone()));
+
+        let key = format!("{db}.{table}");
+        if !inner.tables.contains_key(&key) {
+            let error = ErrorResponse::new(
+                Some("table".to_string()),
+                Some(table),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            return (StatusCode::NOT_FOUND, Json(error)).into_response();
+        }
+
+        let registered_partitions = inner.partitions.entry(key).or_default();
+        let has_missing = request.partition_specs.iter().any(|spec| {
+            !registered_partitions
+                .iter()
+                .any(|partition| partition.spec == *spec)
+        });
+        if has_missing && !request.ignore_if_not_exists {
+            let error = ErrorResponse::new(
+                Some("partition".to_string()),
+                Some(table),
+                Some("Some partitions do not exist".to_string()),
+                Some(StatusCode::NOT_FOUND.as_u16() as i32),
+            );
+            return (StatusCode::NOT_FOUND, Json(error)).into_response();
+        }
+
+        registered_partitions
+            .retain(|partition| !request.partition_specs.contains(&partition.spec));
+        let response = json!({"success": true});
+        (StatusCode::OK, Json(response)).into_response()
     }
 
     /// Handle POST /rename-table - rename a table.
@@ -827,7 +1076,6 @@ impl RESTServer {
             if s.no_permission_tables.remove(&source_key) {
                 s.no_permission_tables.insert(dest_key.clone());
             }
-
             (StatusCode::OK, Json(serde_json::json!(""))).into_response()
         } else {
             let err = ErrorResponse::new(
@@ -930,6 +1178,16 @@ impl RESTServer {
         self.inner.lock().unwrap().drop_view_error_status = status;
     }
 
+    /// Make the create-partitions endpoint return the given status.
+    pub fn set_create_partitions_error_status(&self, status: Option<StatusCode>) {
+        self.inner.lock().unwrap().create_partitions_error_status = status;
+    }
+
+    /// Make the list-partitions endpoint return the given status.
+    pub fn set_list_partitions_error_status(&self, status: Option<StatusCode>) {
+        self.inner.lock().unwrap().list_partitions_error_status = status;
+    }
+
     /// Add a table with schema and path to the server state.
     ///
     /// This is needed for `RESTCatalog::get_table` which requires
@@ -972,6 +1230,100 @@ impl RESTServer {
         let mut s = self.inner.lock().unwrap();
         s.no_permission_tables.insert(format!("{database}.{table}"));
     }
+
+    /// Set whether a stored table is external.
+    pub fn set_table_external(&self, database: &str, table: &str, is_external: bool) {
+        let key = format!("{database}.{table}");
+        let mut state = self.inner.lock().unwrap();
+        state
+            .tables
+            .get_mut(&key)
+            .unwrap_or_else(|| panic!("table {key} does not exist"))
+            .is_external = Some(is_external);
+    }
+
+    /// Set the catalog-registered partitions for a table.
+    pub fn set_table_partitions(
+        &self,
+        database: &str,
+        table: &str,
+        partition_specs: Vec<HashMap<String, String>>,
+    ) {
+        let partitions = partition_specs
+            .into_iter()
+            .map(partition_from_spec)
+            .collect();
+        let key = format!("{database}.{table}");
+        let mut inner = self.inner.lock().unwrap();
+        assert!(
+            inner.tables.contains_key(&key),
+            "table {key} does not exist"
+        );
+        inner.partitions.insert(key.clone(), partitions);
+        inner.partition_page_responses.remove(&key);
+        inner.partition_list_call_counts.remove(&key);
+    }
+
+    /// Set explicit list-partitions pages and response tokens in request order.
+    pub fn set_table_partition_page_responses(
+        &self,
+        database: &str,
+        table: &str,
+        responses: Vec<PartitionSpecPageResponse>,
+    ) {
+        let responses = responses
+            .into_iter()
+            .map(|(specs, token)| (specs.into_iter().map(partition_from_spec).collect(), token))
+            .collect();
+        let key = format!("{database}.{table}");
+        let mut inner = self.inner.lock().unwrap();
+        assert!(
+            inner.tables.contains_key(&key),
+            "table {key} does not exist"
+        );
+        inner
+            .partition_page_responses
+            .insert(key.clone(), responses);
+        inner.partition_list_call_counts.remove(&key);
+    }
+
+    /// Return the `partitionNamePattern` of every partition-list request the table
+    /// received, in order, with `None` where the client sent no pattern.
+    pub fn table_partition_list_name_patterns(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> Vec<Option<String>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .partition_list_name_patterns
+            .get(&format!("{database}.{table}"))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Return how many paged partition-list requests the table received.
+    pub fn table_partition_list_call_count(&self, database: &str, table: &str) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .partition_list_call_counts
+            .get(&format!("{database}.{table}"))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Return all create-partitions calls received by the server.
+    pub fn create_partitions_calls(&self) -> Vec<(String, String, CreatePartitionsRequest)> {
+        self.inner.lock().unwrap().create_partitions_calls.clone()
+    }
+
+    /// Return all drop-partitions calls received by the server.
+    pub fn drop_partitions_calls(&self) -> Vec<(String, String, DropPartitionsRequest)> {
+        self.inner.lock().unwrap().drop_partitions_calls.clone()
+    }
+
     /// Get the server URL.
     pub fn url(&self) -> Option<String> {
         self.addr.map(|a| format!("http://{a}"))
@@ -1088,6 +1440,14 @@ pub async fn start_mock_server(
             get(RESTServer::get_table)
                 .post(RESTServer::alter_table)
                 .delete(RESTServer::drop_table),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/partitions"),
+            get(RESTServer::list_partitions).post(RESTServer::create_partitions),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/partitions/drop"),
+            post(RESTServer::drop_partitions),
         )
         .route(
             &format!("{prefix}/databases/:db/views"),

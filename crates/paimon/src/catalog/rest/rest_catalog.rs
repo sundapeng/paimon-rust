@@ -38,6 +38,8 @@ use crate::spec::{Partition, Schema, SchemaChange};
 use crate::table::{RESTEnv, Table};
 use crate::Result;
 
+const PARTITION_BATCH_SIZE: usize = 1000;
+
 /// REST catalog implementation.
 ///
 /// This catalog communicates with a Paimon REST catalog server
@@ -411,16 +413,64 @@ impl Catalog for RESTCatalog {
         ))
     }
 
+    async fn create_partitions(
+        &self,
+        identifier: &Identifier,
+        partition_specs: Vec<HashMap<String, String>>,
+        ignore_if_exists: bool,
+    ) -> Result<()> {
+        if partition_specs.is_empty() {
+            return Ok(());
+        }
+        if !ignore_if_exists {
+            return self
+                .api
+                .create_partitions(identifier, partition_specs, false)
+                .await
+                .map_err(|error| map_rest_error_for_create_partitions(error, identifier));
+        }
+
+        for batch in partition_specs.chunks(PARTITION_BATCH_SIZE) {
+            self.api
+                .create_partitions(identifier, batch.to_vec(), true)
+                .await
+                .map_err(|error| map_rest_error_for_create_partitions(error, identifier))?;
+        }
+        Ok(())
+    }
+
+    async fn drop_partitions(
+        &self,
+        identifier: &Identifier,
+        partition_specs: Vec<HashMap<String, String>>,
+    ) -> Result<()> {
+        if partition_specs.is_empty() {
+            return Ok(());
+        }
+        for batch in partition_specs.chunks(PARTITION_BATCH_SIZE) {
+            self.api
+                .drop_partitions(identifier, batch.to_vec(), true)
+                .await
+                .map_err(|error| map_rest_error_for_partition_request(error, identifier))?;
+        }
+        Ok(())
+    }
+
     async fn list_partitions(&self, identifier: &Identifier) -> Result<Vec<Partition>> {
         match self.api.list_partitions(identifier).await {
-            Ok(parts) => Ok(parts),
-            Err(Error::RestApi {
-                source: RestError::NotImplemented { .. },
-            }) => {
+            Ok(partitions) => Ok(partitions),
+            Err(
+                error @ Error::RestApi {
+                    source: RestError::NotImplemented { .. },
+                },
+            ) => {
                 let table = self.get_table(identifier).await?;
+                if table.has_catalog_managed_partitions() {
+                    return Err(error);
+                }
                 list_partitions_from_file_system(&table).await
             }
-            Err(e) => Err(map_rest_error_for_table(e, identifier)),
+            Err(error) => Err(map_rest_error_for_table(error, identifier)),
         }
     }
 
@@ -432,21 +482,27 @@ impl Catalog for RESTCatalog {
     ) -> Result<PagedList<Partition>> {
         match self
             .api
-            .list_partitions_paged(identifier, max_results, page_token)
+            .list_partitions_paged(identifier, max_results, page_token, None)
             .await
         {
             Ok(page) => Ok(page),
-            Err(Error::RestApi {
-                source: RestError::NotImplemented { .. },
-            }) => {
+            Err(
+                error @ Error::RestApi {
+                    source: RestError::NotImplemented { .. },
+                },
+            ) => {
                 let table = self.get_table(identifier).await?;
-                let parts = list_partitions_from_file_system(&table).await?;
-                Ok(PagedList::new(parts, None))
+                if table.has_catalog_managed_partitions() {
+                    return Err(error);
+                }
+                let partitions = list_partitions_from_file_system(&table).await?;
+                Ok(PagedList::new(partitions, None))
             }
-            Err(e) => Err(map_rest_error_for_table(e, identifier)),
+            Err(error) => Err(map_rest_error_for_table(error, identifier)),
         }
     }
 }
+
 // ============================================================================
 // Error mapping helpers
 // ============================================================================
@@ -490,6 +546,36 @@ fn map_rest_error_for_table(err: Error, identifier: &Identifier) -> Error {
             full_name: identifier.full_name(),
         },
         other => other,
+    }
+}
+
+fn map_rest_error_for_create_partitions(err: Error, identifier: &Identifier) -> Error {
+    match err {
+        Error::RestApi {
+            source: RestError::AlreadyExists { message, .. },
+        } => Error::DataInvalid {
+            message: format!(
+                "One or more partitions already exist for table {}: {message}",
+                identifier.full_name()
+            ),
+            source: None,
+        },
+        other => map_rest_error_for_partition_request(other, identifier),
+    }
+}
+
+fn map_rest_error_for_partition_request(err: Error, identifier: &Identifier) -> Error {
+    match err {
+        Error::RestApi {
+            source: RestError::BadRequest { message },
+        } => Error::DataInvalid {
+            message: format!(
+                "Invalid partition request for table {}: {message}",
+                identifier.full_name()
+            ),
+            source: None,
+        },
+        other => map_rest_error_for_table(other, identifier),
     }
 }
 

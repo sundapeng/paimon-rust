@@ -560,6 +560,38 @@ pub trait Catalog: Send + Sync {
         })
     }
 
+    // ======================= partition methods ===============================
+
+    /// Register table partition specs in the catalog.
+    ///
+    /// When `ignore_if_exists` is false, implementations must reject the
+    /// entire request if any supplied spec already exists. When true, existing
+    /// specs are ignored so callers can safely retry the request.
+    async fn create_partitions(
+        &self,
+        _identifier: &Identifier,
+        _partition_specs: Vec<HashMap<String, String>>,
+        _ignore_if_exists: bool,
+    ) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "Catalog does not support creating partitions".to_string(),
+        })
+    }
+
+    /// Unregister table partition metadata from the catalog.
+    ///
+    /// This does not delete partition directories or data files. Missing specs
+    /// are ignored so callers can safely retry the request.
+    async fn drop_partitions(
+        &self,
+        _identifier: &Identifier,
+        _partition_specs: Vec<HashMap<String, String>>,
+    ) -> Result<()> {
+        Err(Error::Unsupported {
+            message: "Catalog does not support dropping partitions".to_string(),
+        })
+    }
+
     /// List partitions for a table.
     ///
     /// Default impl scans the table's manifest entries via
