@@ -34,7 +34,7 @@ use crate::catalog::{
 use crate::common::{CatalogOptions, Options};
 use crate::error::Error;
 use crate::io::cache::{create_local_cache_with_namespace, LocalCache};
-use crate::spec::{Partition, Schema, SchemaChange};
+use crate::spec::{Partition, PartitionStatistics, Schema, SchemaChange};
 use crate::table::{RESTEnv, Table};
 use crate::Result;
 
@@ -413,26 +413,42 @@ impl Catalog for RESTCatalog {
         ))
     }
 
-    async fn create_partitions(
+    async fn create_partitions_with_statistics(
         &self,
         identifier: &Identifier,
         partition_specs: Vec<HashMap<String, String>>,
         ignore_if_exists: bool,
+        statistics: Option<Vec<PartitionStatistics>>,
+        replace_statistics: bool,
     ) -> Result<()> {
+        let statistics = statistics
+            .map(|statistics| index_statistics_by_spec(identifier, &partition_specs, statistics))
+            .transpose()?;
         if partition_specs.is_empty() {
             return Ok(());
         }
-        if !ignore_if_exists {
-            return self
-                .api
-                .create_partitions(identifier, partition_specs, false)
-                .await
-                .map_err(|error| map_rest_error_for_create_partitions(error, identifier));
-        }
-
-        for batch in partition_specs.chunks(PARTITION_BATCH_SIZE) {
+        // A strict create is rejected whole when any partition already exists, so it is never
+        // split; an idempotent one is sent in bounded batches, each with its own statistics.
+        let batch_size = if ignore_if_exists {
+            PARTITION_BATCH_SIZE
+        } else {
+            partition_specs.len()
+        };
+        for batch in partition_specs.chunks(batch_size) {
+            let batch_statistics = statistics.as_ref().map(|by_spec| {
+                batch
+                    .iter()
+                    .filter_map(|spec| by_spec.get(&spec_key(spec)).cloned())
+                    .collect::<Vec<_>>()
+            });
             self.api
-                .create_partitions(identifier, batch.to_vec(), true)
+                .create_partitions_with_statistics(
+                    identifier,
+                    batch.to_vec(),
+                    ignore_if_exists,
+                    batch_statistics,
+                    replace_statistics,
+                )
                 .await
                 .map_err(|error| map_rest_error_for_create_partitions(error, identifier))?;
         }
@@ -594,6 +610,56 @@ fn map_rest_error_for_table(err: Error, identifier: &Identifier) -> Error {
         },
         other => other,
     }
+}
+
+/// A partition spec in a form that can key a map.
+fn spec_key(spec: &HashMap<String, String>) -> Vec<(String, String)> {
+    let mut entries = spec
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    entries.sort_unstable();
+    entries
+}
+
+/// Index reported statistics by the spec they describe, rejecting a report for a partition that
+/// is not being created and a partition reported twice: the catalog cannot tell which of two
+/// reports is meant.
+fn index_statistics_by_spec(
+    identifier: &Identifier,
+    partition_specs: &[HashMap<String, String>],
+    statistics: Vec<PartitionStatistics>,
+) -> Result<HashMap<Vec<(String, String)>, PartitionStatistics>> {
+    let requested = partition_specs
+        .iter()
+        .map(spec_key)
+        .collect::<std::collections::HashSet<_>>();
+    let mut by_spec = HashMap::with_capacity(statistics.len());
+    for statistic in statistics {
+        let key = spec_key(&statistic.spec);
+        if !requested.contains(&key) {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "Partition statistics were reported for {:?} of table {}, which is not among \
+                     the partitions being created",
+                    statistic.spec,
+                    identifier.full_name()
+                ),
+                source: None,
+            });
+        }
+        let spec = statistic.spec.clone();
+        if by_spec.insert(key, statistic).is_some() {
+            return Err(Error::DataInvalid {
+                message: format!(
+                    "Partition statistics were reported twice for {spec:?} of table {}",
+                    identifier.full_name()
+                ),
+                source: None,
+            });
+        }
+    }
+    Ok(by_spec)
 }
 
 fn map_rest_error_for_create_partitions(err: Error, identifier: &Identifier) -> Error {

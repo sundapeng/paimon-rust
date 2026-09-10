@@ -97,10 +97,10 @@ fn partition_spec_matches_name_pattern(spec: &HashMap<String, String>, pattern: 
 fn partition_from_spec(spec: HashMap<String, String>) -> Partition {
     Partition {
         spec,
-        record_count: 0,
-        file_size_in_bytes: 0,
-        file_count: 0,
-        last_file_creation_time: 0,
+        record_count: Partition::UNKNOWN,
+        file_size_in_bytes: Partition::UNKNOWN,
+        file_count: Partition::UNKNOWN,
+        last_file_creation_time: Partition::UNKNOWN,
         total_buckets: 0,
         done: false,
         created_at: None,
@@ -896,6 +896,42 @@ impl RESTServer {
                 registered_partitions.push(partition_from_spec(spec));
             }
         }
+        // As the catalog does: a negative field was never measured and leaves the stored value
+        // alone; a replacing report overwrites what is stored, any other is added to it.
+        let replace = request.replace_statistics.unwrap_or(false);
+        for statistic in request.partition_statistics.unwrap_or_default() {
+            let Some(partition) = registered_partitions
+                .iter_mut()
+                .find(|partition| partition.spec == statistic.spec)
+            else {
+                continue;
+            };
+            for (stored, reported) in [
+                (&mut partition.record_count, statistic.record_count),
+                (
+                    &mut partition.file_size_in_bytes,
+                    statistic.file_size_in_bytes,
+                ),
+                (&mut partition.file_count, statistic.file_count),
+            ] {
+                if reported >= 0 {
+                    *stored = if replace {
+                        reported
+                    } else {
+                        (*stored).max(0) + reported
+                    };
+                }
+            }
+            if statistic.last_file_creation_time >= 0 {
+                partition.last_file_creation_time = if replace {
+                    statistic.last_file_creation_time
+                } else {
+                    partition
+                        .last_file_creation_time
+                        .max(statistic.last_file_creation_time)
+                };
+            }
+        }
         let response = json!({"success": true});
         (StatusCode::OK, Json(response)).into_response()
     }
@@ -1429,6 +1465,17 @@ impl RESTServer {
             })
             .unwrap_or_else(|| panic!("partition {spec:?} is not registered"));
         partition.options = Some(options);
+    }
+
+    /// Return the partitions registered for a table, statistics included, in registration order.
+    pub fn table_partitions(&self, database: &str, table: &str) -> Vec<Partition> {
+        self.inner
+            .lock()
+            .unwrap()
+            .partitions
+            .get(&format!("{database}.{table}"))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Return the specs registered for a table, in registration order.

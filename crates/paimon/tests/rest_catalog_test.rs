@@ -31,8 +31,8 @@ use paimon::api::ConfigResponse;
 use paimon::catalog::{Catalog, Function, FunctionDefinition, Identifier, RESTCatalog, ViewSchema};
 use paimon::common::Options;
 use paimon::spec::{
-    BigIntType, BlobType, BlobViewStruct, DataField, DataType, Datum, IntType, PredicateBuilder,
-    Schema, SchemaChange, VarCharType,
+    BigIntType, BlobType, BlobViewStruct, DataField, DataType, Datum, IntType, PartitionStatistics,
+    PredicateBuilder, Schema, SchemaChange, VarCharType,
 };
 use paimon::{CatalogOptions, FileSystemCatalog, Table};
 
@@ -234,6 +234,74 @@ async fn test_rest_catalog_keeps_non_idempotent_create_in_one_request() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].2.partition_specs, partition_specs);
     assert!(!calls[0].2.ignore_if_exists);
+}
+
+#[tokio::test]
+async fn test_rest_catalog_sends_partition_statistics_with_their_batch() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let identifier = Identifier::new("default", "managed_table");
+    ctx.server.add_table("default", "managed_table");
+    let specs = (0..1001)
+        .map(|value| HashMap::from([("dt".to_string(), value.to_string())]))
+        .collect::<Vec<_>>();
+    let statistic = |spec: &HashMap<String, String>| PartitionStatistics {
+        spec: spec.clone(),
+        record_count: 1,
+        file_size_in_bytes: 2,
+        file_count: 3,
+        last_file_creation_time: 4,
+        total_buckets: -1,
+    };
+
+    // Reported for the last partition and the first, in that order.
+    ctx.catalog
+        .create_partitions_with_statistics(
+            &identifier,
+            specs.clone(),
+            true,
+            Some(vec![statistic(&specs[1000]), statistic(&specs[0])]),
+            true,
+        )
+        .await
+        .unwrap();
+
+    let calls = ctx.server.create_partitions_calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        calls[0].2.partition_statistics,
+        Some(vec![statistic(&specs[0])])
+    );
+    assert_eq!(
+        calls[1].2.partition_statistics,
+        Some(vec![statistic(&specs[1000])])
+    );
+    assert!(calls
+        .iter()
+        .all(|(_, _, request)| request.replace_statistics == Some(true)));
+
+    // A report the catalog could not place is refused before anything is sent.
+    let unknown = HashMap::from([("dt".to_string(), "x".to_string())]);
+    for statistics in [
+        vec![statistic(&unknown)],
+        vec![statistic(&specs[0]), statistic(&specs[0])],
+    ] {
+        let error = ctx
+            .catalog
+            .create_partitions_with_statistics(
+                &identifier,
+                specs.clone(),
+                true,
+                Some(statistics),
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, paimon::Error::DataInvalid { .. }),
+            "{error}"
+        );
+    }
+    assert_eq!(ctx.server.create_partitions_calls().len(), 2);
 }
 
 #[tokio::test]

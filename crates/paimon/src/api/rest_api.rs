@@ -568,11 +568,37 @@ impl RESTApi {
         partition_specs: Vec<HashMap<String, String>>,
         ignore_if_exists: bool,
     ) -> Result<()> {
+        self.create_partitions_with_statistics(
+            identifier,
+            partition_specs,
+            ignore_if_exists,
+            None,
+            false,
+        )
+        .await
+    }
+
+    /// Create table partitions and report statistics for them in a single REST request.
+    ///
+    /// Statistics are matched to the specs by spec and may cover only some of them.
+    /// `replace_statistics` says whether they replace what the catalog holds or add to it, and is
+    /// not sent when no statistics are.
+    pub async fn create_partitions_with_statistics(
+        &self,
+        identifier: &Identifier,
+        partition_specs: Vec<HashMap<String, String>>,
+        ignore_if_exists: bool,
+        statistics: Option<Vec<PartitionStatistics>>,
+        replace_statistics: bool,
+    ) -> Result<()> {
         let database = identifier.database();
         let table = identifier.object();
         validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
         let path = self.resource_paths.partitions(database, table);
-        let request = CreatePartitionsRequest::new(partition_specs, ignore_if_exists);
+        let mut request = CreatePartitionsRequest::new(partition_specs, ignore_if_exists);
+        if let Some(statistics) = statistics {
+            request = request.with_statistics(statistics, replace_statistics);
+        }
         let _resp: serde_json::Value = self.client.post(&path, &request).await?;
         Ok(())
     }

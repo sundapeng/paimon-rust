@@ -24,7 +24,7 @@ use std::collections::HashMap;
 
 use crate::{
     catalog::{Function, FunctionDefinition, Identifier, ViewSchema},
-    spec::{DataField, Schema, SchemaChange},
+    spec::{DataField, PartitionStatistics, Schema, SchemaChange},
 };
 
 /// Request to create a new database.
@@ -179,6 +179,13 @@ pub struct CreatePartitionsRequest {
         deserialize_with = "deserialize_null_to_true"
     )]
     pub ignore_if_exists: bool,
+    /// Statistics reported for the partitions, matched to them by spec; absent unless reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_statistics: Option<Vec<PartitionStatistics>>,
+    /// Whether the reported statistics replace what the catalog holds rather than add to it;
+    /// present only together with `partition_statistics`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_statistics: Option<bool>,
 }
 
 impl CreatePartitionsRequest {
@@ -187,7 +194,16 @@ impl CreatePartitionsRequest {
         Self {
             partition_specs,
             ignore_if_exists,
+            partition_statistics: None,
+            replace_statistics: None,
         }
+    }
+
+    /// Report statistics for the partitions in the same request.
+    pub fn with_statistics(mut self, statistics: Vec<PartitionStatistics>, replace: bool) -> Self {
+        self.partition_statistics = Some(statistics);
+        self.replace_statistics = Some(replace);
+        self
     }
 }
 
@@ -351,6 +367,39 @@ mod tests {
                     "hour": "10"
                 }],
                 "ignoreIfExists": false
+            })
+        );
+    }
+
+    #[test]
+    fn test_create_partitions_request_sends_statistics_only_when_reported() {
+        let spec = HashMap::from([("dt".to_string(), "2026-07-22".to_string())]);
+        let request = CreatePartitionsRequest::new(vec![spec.clone()], true).with_statistics(
+            vec![PartitionStatistics {
+                spec: spec.clone(),
+                record_count: -1,
+                file_size_in_bytes: 1024,
+                file_count: 2,
+                last_file_creation_time: 1_700_000_000_000,
+                total_buckets: -1,
+            }],
+            true,
+        );
+
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "partitionSpecs": [{"dt": "2026-07-22"}],
+                "ignoreIfExists": true,
+                "partitionStatistics": [{
+                    "spec": {"dt": "2026-07-22"},
+                    "recordCount": -1,
+                    "fileSizeInBytes": 1024,
+                    "fileCount": 2,
+                    "lastFileCreationTime": 1_700_000_000_000_i64,
+                    "totalBuckets": -1
+                }],
+                "replaceStatistics": true
             })
         );
     }

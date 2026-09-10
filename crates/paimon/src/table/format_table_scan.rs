@@ -28,6 +28,7 @@ use super::format_partition::{
 use super::rest_env::LoadedFormatTablePartitionOptions;
 use super::{Plan, RESTEnv, ScanTrace, Table};
 use crate::api::RestError;
+use crate::io::{FileIO, FileStatus};
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
     escape_path_name, extract_datum, unescape_path_name, BinaryRow, BinaryRowBuilder, CoreOptions,
@@ -113,9 +114,22 @@ impl<'a> FormatTableScan<'a> {
         let partition_fields = partition_fields.as_slice();
         let listed: Vec<Vec<crate::DataSplit>> = futures::stream::iter(scan_roots)
             .map(|scan_root| async move {
-                let statuses = self
-                    .list_status_recursive_if_exists(&scan_root.path)
-                    .await?;
+                // Below a complete partition directory nothing is a partition level any more, so
+                // committer staging trees can be left out; a root above that level still names
+                // partition directories, which the hidden-name rule does not apply to.
+                let statuses = if partition_fields.is_empty()
+                    || scan_root.partition.arity() == partition_fields.len() as i32
+                {
+                    list_format_table_data_files(
+                        self.table.file_io(),
+                        &scan_root.path,
+                        format_extension,
+                    )
+                    .await?
+                } else {
+                    self.list_status_recursive_if_exists(&scan_root.path)
+                        .await?
+                };
                 let mut splits = Vec::new();
                 for status in statuses {
                     if let Some(split) = self
@@ -475,6 +489,69 @@ struct ScanRoot {
     partition: BinaryRow,
 }
 
+/// The data files a Format Table reader returns under `root`: files carrying the table's format
+/// extension, skipping every file or directory below `root` whose name starts with `.` or `_`.
+/// That leaves out committer staging trees such as `_temporary` and `__magic_*`, `_SUCCESS`
+/// markers and checksum files, none of which hold committed data. A missing root holds no files.
+///
+/// `root` must be a complete partition directory or the directory of an unpartitioned table:
+/// above that level a value-only layout names the null partition `__DEFAULT_PARTITION__`, which
+/// the rule would drop.
+///
+/// Mirrors the hidden-name rule of Java `FormatTableScan.listDataFiles`.
+pub(crate) async fn list_format_table_data_files(
+    file_io: &FileIO,
+    root: &str,
+    format_extension: &str,
+) -> crate::Result<Vec<FileStatus>> {
+    let statuses = match file_io.list_status_recursive(root).await {
+        Ok(statuses) => statuses,
+        Err(error) if is_storage_not_found(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let root_segments = path_segments(root);
+    let mut files = Vec::with_capacity(statuses.len());
+    for status in statuses {
+        let segments = path_segments(&status.path);
+        // A listing may spell the scheme differently from the root (`file:/` against
+        // `file:///`), so what lies below the root is found by segments, not by string prefix.
+        let below_root = if segments.starts_with(&root_segments) {
+            &segments[root_segments.len()..]
+        } else {
+            &segments[segments.len().saturating_sub(1)..]
+        };
+        let Some(file_name) = below_root.last() else {
+            continue;
+        };
+        if below_root
+            .iter()
+            .any(|segment| segment.starts_with('.') || segment.starts_with('_'))
+            || !file_name.to_ascii_lowercase().ends_with(format_extension)
+        {
+            continue;
+        }
+        let status = if status.size == 0 {
+            file_io.get_status(&status.path).await?
+        } else {
+            status
+        };
+        files.push(status);
+    }
+    Ok(files)
+}
+
+/// The non-empty segments of a path, after its scheme and authority markers.
+fn path_segments(path: &str) -> Vec<&str> {
+    let without_scheme = match path.find("://") {
+        Some(index) => &path[index + 3..],
+        None => path.split_once(':').map_or(path, |(_, rest)| rest),
+    };
+    without_scheme
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect()
+}
+
 fn is_format_table_data_file_name(file_name: &str) -> bool {
     !file_name.is_empty() && !file_name.starts_with('.') && !file_name.starts_with('_')
 }
@@ -802,7 +879,7 @@ fn supported_format_table_formats() -> Vec<&'static str> {
     ]
 }
 
-fn supported_format_table_extension(format: &str) -> crate::Result<&'static str> {
+pub(crate) fn supported_format_table_extension(format: &str) -> crate::Result<&'static str> {
     match format.to_ascii_lowercase().as_str() {
         "parquet" => Ok(".parquet"),
         "orc" => Ok(".orc"),
