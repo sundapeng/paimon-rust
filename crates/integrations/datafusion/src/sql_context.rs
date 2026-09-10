@@ -2106,18 +2106,23 @@ impl SQLContext {
                 let relative_path = partition_paths
                     .relative_path(&partition.spec)
                     .map_err(to_datafusion_error)?;
-                Ok((partition.spec, format!("{table_path}/{relative_path}")))
+                let custom_located = has_custom_location(&partition);
+                Ok((
+                    partition.spec,
+                    format!("{table_path}/{relative_path}"),
+                    custom_located,
+                ))
             })
             .collect::<DFResult<Vec<_>>>()?;
 
-        let mut selected: Vec<(HashMap<String, String>, String)> = Vec::new();
+        let mut selected: Vec<(HashMap<String, String>, String, bool)> = Vec::new();
         let mut selected_paths = HashSet::new();
         for (spec, ignore_if_not_exists) in &requested {
             // Values are compared as the catalog holds them. A request is spelled the way ADD
             // PARTITION writes it, while repair registers the directory spelling, so a partition
             // registered as `month=01` is not the partition `month = 1` names.
             let mut matched = false;
-            for (registered_spec, path) in &registered {
+            for (registered_spec, path, custom_located) in &registered {
                 if !spec
                     .iter()
                     .all(|(key, value)| registered_spec.get(key) == Some(value))
@@ -2126,7 +2131,7 @@ impl SQLContext {
                 }
                 matched = true;
                 if selected_paths.insert(path.clone()) {
-                    selected.push((registered_spec.clone(), path.clone()));
+                    selected.push((registered_spec.clone(), path.clone(), *custom_located));
                 }
             }
             // Only a complete specification names one partition, so only it can be
@@ -2147,11 +2152,17 @@ impl SQLContext {
         catalog
             .drop_partitions(
                 identifier,
-                selected.iter().map(|(spec, _)| spec.clone()).collect(),
+                selected.iter().map(|(spec, _, _)| spec.clone()).collect(),
             )
             .await
             .map_err(to_datafusion_error)?;
-        for (_, path) in selected {
+        for (_, path, custom_located) in selected {
+            // A partition registered at a location of its own keeps its data there, as in Java:
+            // dropping it only unregisters it, and the table directory it does not use is left
+            // alone.
+            if custom_located {
+                continue;
+            }
             table
                 .file_io()
                 .delete_dir(&path)
@@ -3462,6 +3473,15 @@ fn extract_options(opts: &CreateTableOptions) -> DFResult<Vec<(String, String)>>
 
 fn is_table_not_exist(e: &paimon::Error) -> bool {
     matches!(e, paimon::Error::TableNotExist { .. })
+}
+
+/// Whether the catalog registered a partition at a location of its own rather than under the
+/// table directory.
+fn has_custom_location(partition: &paimon::spec::Partition) -> bool {
+    partition
+        .options
+        .as_ref()
+        .is_some_and(|options| options.contains_key("path"))
 }
 
 fn ensure_catalog_managed_format_table(table: &paimon::Table, operation: &str) -> DFResult<()> {

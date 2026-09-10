@@ -1410,6 +1410,27 @@ impl RESTServer {
         inner.partition_list_call_counts.remove(&key);
     }
 
+    /// Attach catalog options, such as a custom `path`, to a registered partition.
+    pub fn set_table_partition_options(
+        &self,
+        database: &str,
+        table: &str,
+        spec: &HashMap<String, String>,
+        options: HashMap<String, String>,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        let partition = inner
+            .partitions
+            .get_mut(&format!("{database}.{table}"))
+            .and_then(|partitions| {
+                partitions
+                    .iter_mut()
+                    .find(|partition| &partition.spec == spec)
+            })
+            .unwrap_or_else(|| panic!("partition {spec:?} is not registered"));
+        partition.options = Some(options);
+    }
+
     /// Return the specs registered for a table, in registration order.
     pub fn table_partition_specs(
         &self,

@@ -622,6 +622,77 @@ async fn test_drop_partition_looks_up_complete_specifications_by_name() {
     assert!(server.table_partition_specs(DATABASE, TABLE).is_empty());
 }
 
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_a_partition_at_a_custom_location_is_not_taken_from_the_table_directory() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let external_dir = tempfile::tempdir().unwrap();
+    let schema = format_table_schema(&[("dt", DataType::VarChar(VarCharType::new(255).unwrap()))]);
+    let (server, context) = setup_rest_table(&temp_dir, schema).await;
+    for dt in ["a", "b"] {
+        context
+            .sql(&format!(
+                "ALTER TABLE paimon.default.events ADD PARTITION (dt = '{dt}')"
+            ))
+            .await
+            .unwrap();
+    }
+    write_ids(&temp_dir.path().join("dt=a"), &[1]);
+    // Another engine registered dt=b somewhere else; the table directory still has a stale copy.
+    write_ids(&temp_dir.path().join("dt=b"), &[2]);
+    write_ids(external_dir.path(), &[3]);
+    server.set_table_partition_options(
+        DATABASE,
+        TABLE,
+        &spec(&[("dt", "b")]),
+        HashMap::from([(
+            "path".to_string(),
+            format!("file://{}", external_dir.path().display()),
+        )]),
+    );
+
+    // Reading the default directory would return the stale row, so a scan that reaches the
+    // partition fails instead. One that does not reach it is unaffected.
+    let sql = "SELECT id FROM paimon.default.events WHERE dt = 'b'";
+    let error = match context.sql(sql).await {
+        Ok(frame) => frame.collect().await.unwrap_err(),
+        Err(error) => error,
+    }
+    .to_string();
+    assert!(error.contains("custom location"), "{error}");
+    assert_eq!(
+        ids(
+            &context,
+            "SELECT id FROM paimon.default.events WHERE dt = 'a'"
+        )
+        .await,
+        vec![1]
+    );
+
+    // Its directory is not under the table, so repair does not read it as missing.
+    std::fs::remove_dir_all(temp_dir.path().join("dt=b")).unwrap();
+    context
+        .sql("MSCK REPAIR TABLE paimon.default.events SYNC PARTITIONS")
+        .await
+        .unwrap();
+    assert!(server
+        .table_partition_specs(DATABASE, TABLE)
+        .contains(&spec(&[("dt", "b")])));
+
+    // Dropping it unregisters it and deletes nothing, least of all its own data.
+    std::fs::create_dir_all(temp_dir.path().join("dt=b")).unwrap();
+    context
+        .sql("ALTER TABLE paimon.default.events DROP PARTITION (dt = 'b')")
+        .await
+        .unwrap();
+    assert_eq!(
+        server.table_partition_specs(DATABASE, TABLE),
+        vec![spec(&[("dt", "a")])]
+    );
+    assert!(external_dir.path().join("part-0.parquet").exists());
+    assert_partition_directories(&temp_dir, &[("dt=b", true)]);
+}
+
 fn spec(values: &[(&str, &str)]) -> HashMap<String, String> {
     values
         .iter()

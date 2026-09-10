@@ -32,7 +32,7 @@ use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
     escape_path_name, extract_datum, unescape_path_name, BinaryRow, BinaryRowBuilder, CoreOptions,
     DataField, DataFileMeta, DataType, Datum, Partition, PartitionComputer, Predicate,
-    PredicateOperator,
+    PredicateOperator, PATH_OPTION,
 };
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::source::{DataSplitBuilder, RowRange};
@@ -292,16 +292,36 @@ impl<'a> FormatTableScan<'a> {
                 continue;
             }
             let path = join_path(table_path, &partition_path);
-            let partition = partition_row_from_catalog_spec(
+            let row = partition_row_from_catalog_spec(
                 &partition.spec,
                 partition_fields,
                 partition_keys,
                 default_partition_name,
             )
             .map_err(|error| self.invalid_catalog_partition_metadata(error))?;
-            if self.partition_matches(&partition)? {
-                roots.push(ScanRoot { path, partition });
+            if !self.partition_matches(&row)? {
+                continue;
             }
+            // The Rust reader cannot resolve a partition's own location yet, and reading the
+            // default directory in its place would return whatever happens to be there.
+            if partition
+                .options
+                .as_ref()
+                .is_some_and(|options| options.contains_key(PATH_OPTION))
+            {
+                return Err(crate::Error::Unsupported {
+                    message: format!(
+                        "Partition {:?} of Format Table {} is registered at a custom location, \
+                         which the Rust reader does not support yet",
+                        partition.spec,
+                        self.table.identifier().full_name()
+                    ),
+                });
+            }
+            roots.push(ScanRoot {
+                path,
+                partition: row,
+            });
         }
         roots.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(roots)

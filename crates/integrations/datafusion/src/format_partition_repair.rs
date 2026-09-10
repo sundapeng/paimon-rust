@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use paimon::catalog::{Catalog, Identifier};
 use paimon::spec::CoreOptions;
@@ -57,6 +57,19 @@ pub(crate) async fn repair(
         )
         .await?;
     let registered_partitions = catalog.list_partitions(identifier).await?;
+    // A partition registered at a location of its own does not live under the table directory,
+    // so discovery never finds it there. Repair leaves it registered rather than reading that as
+    // a directory gone missing.
+    let custom_located = registered_partitions
+        .iter()
+        .filter(|partition| {
+            partition
+                .options
+                .as_ref()
+                .is_some_and(|options| options.contains_key("path"))
+        })
+        .map(|partition| partition_paths.partition_name(&partition.spec))
+        .collect::<paimon::Result<HashSet<_>>>()?;
 
     let discovered_by_name = index_specs_by_name(&partition_paths, discovered_specs)?;
     let registered_by_name = index_specs_by_name(
@@ -79,7 +92,9 @@ pub(crate) async fn repair(
     let to_unregister = if matches!(mode, RepairMode::Drop | RepairMode::Sync) {
         registered_by_name
             .iter()
-            .filter(|(name, _)| !discovered_by_name.contains_key(*name))
+            .filter(|(name, _)| {
+                !discovered_by_name.contains_key(*name) && !custom_located.contains(*name)
+            })
             .map(|(_, spec)| spec.clone())
             .collect::<Vec<_>>()
     } else {
