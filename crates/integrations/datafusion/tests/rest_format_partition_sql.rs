@@ -19,14 +19,17 @@
 mod mock_server;
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
-use arrow_array::StringArray;
+use arrow_array::{Int64Array, RecordBatch, StringArray};
+use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
 use paimon::api::ConfigResponse;
 use paimon::catalog::RESTCatalog;
 use paimon::spec::{BigIntType, BooleanType, DataType, DateType, IntType, Schema, VarCharType};
 use paimon::{CatalogOptions, Options};
 use paimon_datafusion::SQLContext;
+use parquet::arrow::ArrowWriter;
 use tempfile::TempDir;
 
 use mock_server::{start_mock_server, RESTServer};
@@ -363,6 +366,80 @@ async fn test_catalog_managed_scan_pushes_a_partition_name_pattern() {
             "{predicate} pushed {pushed:?}, expected {expected:?}"
         );
     }
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_format_table_filter_on_a_partition_column_reads_the_directory_value() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let schema = format_table_schema(&[
+        ("dt", DataType::VarChar(VarCharType::new(255).unwrap())),
+        ("active", DataType::Boolean(BooleanType::new())),
+    ]);
+    let (_server, context) = setup_rest_table(&temp_dir, schema).await;
+    for (dt, active, id) in [("a", true, 1), ("b", false, 2)] {
+        context
+            .sql(&format!(
+                "ALTER TABLE paimon.default.events ADD PARTITION (dt = '{dt}', active = {active})"
+            ))
+            .await
+            .unwrap();
+        write_ids(
+            &temp_dir.path().join(format!("dt={dt}/active={active}")),
+            &[id],
+        );
+    }
+
+    // The data files hold no partition columns. A filter the scan cannot turn into a partition
+    // predicate still has to see the value from the directory name, not a missing column.
+    for (predicate, expected) in [
+        ("active", vec![1]),
+        ("NOT active", vec![2]),
+        ("upper(dt) = 'B'", vec![2]),
+        ("concat(dt, '-') = 'a-'", vec![1]),
+    ] {
+        assert_eq!(
+            ids(
+                &context,
+                &format!("SELECT id FROM paimon.default.events WHERE {predicate}")
+            )
+            .await,
+            expected,
+            "{predicate}"
+        );
+    }
+}
+
+fn write_ids(directory: &Path, ids: &[i64]) {
+    std::fs::create_dir_all(directory).unwrap();
+    let schema = Arc::new(ArrowSchema::new(vec![Field::new(
+        "id",
+        ArrowDataType::Int64,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(ids.to_vec()))],
+    )
+    .unwrap();
+    let file = std::fs::File::create(directory.join("part-0.parquet")).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+}
+
+async fn ids(context: &SQLContext, sql: &str) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for batch in context.sql(sql).await.unwrap().collect().await.unwrap() {
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        ids.extend(values.iter().flatten());
+    }
+    ids.sort_unstable();
+    ids
 }
 
 async fn add_partitions(context: &SQLContext, partitions: &[(&str, &str)]) {
