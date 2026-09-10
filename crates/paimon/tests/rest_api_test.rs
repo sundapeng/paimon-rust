@@ -641,6 +641,74 @@ async fn test_partition_mutations_post_expected_requests() {
 }
 
 #[tokio::test]
+async fn test_list_partitions_by_names_returns_the_registered_ones() {
+    let (ctx, identifier) = setup_partition_api().await;
+    let registered = HashMap::from([("dt".to_string(), "2026-07-22".to_string())]);
+    let missing = HashMap::from([("dt".to_string(), "2026-07-23".to_string())]);
+    ctx.server
+        .set_table_partitions("default", "managed_table", vec![registered.clone()]);
+
+    let partitions = ctx
+        .api
+        .list_partitions_by_names(&identifier, vec![registered.clone(), missing.clone()])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        partitions
+            .into_iter()
+            .map(|partition| partition.spec)
+            .collect::<Vec<_>>(),
+        vec![registered.clone()]
+    );
+    assert_eq!(
+        ctx.server
+            .table_partition_list_by_names_calls("default", "managed_table"),
+        vec![vec![registered, missing]]
+    );
+}
+
+#[tokio::test]
+async fn test_list_partitions_by_filter_sends_filter_pattern_and_page_size() {
+    let (ctx, identifier) = setup_partition_api().await;
+    let wanted = HashMap::from([("dt".to_string(), "2026-07-22".to_string())]);
+    ctx.server.set_table_partitions(
+        "default",
+        "managed_table",
+        vec![
+            wanted.clone(),
+            HashMap::from([("dt".to_string(), "2026-07-23".to_string())]),
+        ],
+    );
+    let filter = r#"{"kind":"LEAF","transform":{"name":"FIELD_REF","fieldRef":{"index":0,"name":"dt","type":"STRING"}},"function":"EQUAL","literals":["2026-07-22"]}"#;
+
+    let partitions = ctx
+        .api
+        .list_partitions_by_filter(&identifier, filter, Some("dt=2026-07-22"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        partitions
+            .into_iter()
+            .map(|partition| partition.spec)
+            .collect::<Vec<_>>(),
+        vec![wanted]
+    );
+    let requests = ctx
+        .server
+        .table_partition_list_by_filter_requests("default", "managed_table");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].filter, filter);
+    assert_eq!(
+        requests[0].partition_name_pattern.as_deref(),
+        Some("dt=2026-07-22")
+    );
+    assert_eq!(requests[0].max_results, Some(1000));
+    assert_eq!(requests[0].page_token, None);
+}
+
+#[tokio::test]
 async fn test_list_partitions_follows_non_empty_token_after_empty_page() {
     let (ctx, identifier) = setup_partition_api().await;
     let expected = HashMap::from([("dt".to_string(), "2026-07-22".to_string())]);

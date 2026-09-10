@@ -37,8 +37,9 @@ use paimon::api::{
     AlterDatabaseRequest, AlterTableRequest, AuditRESTResponse, ConfigResponse,
     CreateFunctionRequest, CreatePartitionsRequest, CreateViewRequest, DropPartitionsRequest,
     ErrorResponse, GetDatabaseResponse, GetFunctionResponse, GetTableResponse, GetViewResponse,
-    ListDatabasesResponse, ListFunctionsResponse, ListPartitionsResponse, ListTablesResponse,
-    ListViewsResponse, RenameTableRequest, ResourcePaths,
+    ListDatabasesResponse, ListFunctionsResponse, ListPartitionsByFilterRequest,
+    ListPartitionsByNamesRequest, ListPartitionsResponse, ListTablesResponse, ListViewsResponse,
+    RenameTableRequest, ResourcePaths,
 };
 use paimon::catalog::{Function, Identifier};
 use paimon::spec::Partition;
@@ -56,6 +57,10 @@ struct MockState {
     partition_page_responses: HashMap<String, Vec<PartitionPageResponse>>,
     partition_list_call_counts: HashMap<String, usize>,
     partition_list_name_patterns: HashMap<String, Vec<Option<String>>>,
+    partition_list_by_names_calls: HashMap<String, Vec<Vec<HashMap<String, String>>>>,
+    partition_list_by_filter_requests: HashMap<String, Vec<ListPartitionsByFilterRequest>>,
+    list_partitions_by_names_error_status: Option<StatusCode>,
+    list_partitions_by_filter_error_status: Option<StatusCode>,
     view_function_endpoints_unsupported: bool,
     drop_view_error_status: Option<StatusCode>,
     list_page_size: Option<usize>,
@@ -1020,6 +1025,101 @@ impl RESTServer {
         (StatusCode::OK, Json(response)).into_response()
     }
 
+    /// Handle POST /databases/:db/tables/:table/partitions/list-by-names - look up partitions.
+    pub async fn list_partitions_by_names(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(request): Json<ListPartitionsByNamesRequest>,
+    ) -> impl IntoResponse {
+        let mut inner = state.inner.lock().unwrap();
+        let key = format!("{db}.{table}");
+        inner
+            .partition_list_by_names_calls
+            .entry(key.clone())
+            .or_default()
+            .push(request.specs.clone());
+        if !inner.tables.contains_key(&key) {
+            let error = ErrorResponse::new(
+                Some("table".to_string()),
+                Some(table),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            return (StatusCode::NOT_FOUND, Json(error)).into_response();
+        }
+        if let Some(status) = inner.list_partitions_by_names_error_status {
+            let error = ErrorResponse::new(
+                Some("partition".to_string()),
+                Some(table),
+                Some("Listing partitions by names is not implemented".to_string()),
+                Some(status.as_u16() as i32),
+            );
+            return (status, Json(error)).into_response();
+        }
+        let partitions = inner
+            .partitions
+            .get(&key)
+            .map(|partitions| {
+                partitions
+                    .iter()
+                    .filter(|partition| request.specs.contains(&partition.spec))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        (
+            StatusCode::OK,
+            Json(ListPartitionsResponse::new(Some(partitions), None)),
+        )
+            .into_response()
+    }
+
+    /// Handle POST /databases/:db/tables/:table/partitions/list-by-filter - list partitions.
+    ///
+    /// Like a catalog that does not evaluate predicates yet, this applies the name pattern only
+    /// and returns every other registered partition, which the endpoint contract allows.
+    pub async fn list_partitions_by_filter(
+        Path((db, table)): Path<(String, String)>,
+        Extension(state): Extension<Arc<RESTServer>>,
+        Json(request): Json<ListPartitionsByFilterRequest>,
+    ) -> impl IntoResponse {
+        let mut inner = state.inner.lock().unwrap();
+        let key = format!("{db}.{table}");
+        inner
+            .partition_list_by_filter_requests
+            .entry(key.clone())
+            .or_default()
+            .push(request.clone());
+        if !inner.tables.contains_key(&key) {
+            let error = ErrorResponse::new(
+                Some("table".to_string()),
+                Some(table),
+                Some("Not Found".to_string()),
+                Some(404),
+            );
+            return (StatusCode::NOT_FOUND, Json(error)).into_response();
+        }
+        if let Some(status) = inner.list_partitions_by_filter_error_status {
+            let error = ErrorResponse::new(
+                Some("partition".to_string()),
+                Some(table),
+                Some("Listing partitions by filter is not implemented".to_string()),
+                Some(status.as_u16() as i32),
+            );
+            return (status, Json(error)).into_response();
+        }
+        let mut partitions = inner.partitions.get(&key).cloned().unwrap_or_default();
+        if let Some(pattern) = &request.partition_name_pattern {
+            partitions
+                .retain(|partition| partition_spec_matches_name_pattern(&partition.spec, pattern));
+        }
+        (
+            StatusCode::OK,
+            Json(ListPartitionsResponse::new(Some(partitions), None)),
+        )
+            .into_response()
+    }
+
     /// Handle POST /rename-table - rename a table.
     pub async fn rename_table(
         Extension(state): Extension<Arc<RESTServer>>,
@@ -1188,6 +1288,52 @@ impl RESTServer {
         self.inner.lock().unwrap().list_partitions_error_status = status;
     }
 
+    /// Make the list-partitions-by-names endpoint return the given status.
+    pub fn set_list_partitions_by_names_error_status(&self, status: Option<StatusCode>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .list_partitions_by_names_error_status = status;
+    }
+
+    /// Make the list-partitions-by-filter endpoint return the given status.
+    pub fn set_list_partitions_by_filter_error_status(&self, status: Option<StatusCode>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .list_partitions_by_filter_error_status = status;
+    }
+
+    /// Return the specs of every list-by-names request the table received, in order.
+    pub fn table_partition_list_by_names_calls(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> Vec<Vec<HashMap<String, String>>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .partition_list_by_names_calls
+            .get(&format!("{database}.{table}"))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Return every list-by-filter request the table received, in order.
+    pub fn table_partition_list_by_filter_requests(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> Vec<ListPartitionsByFilterRequest> {
+        self.inner
+            .lock()
+            .unwrap()
+            .partition_list_by_filter_requests
+            .get(&format!("{database}.{table}"))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Add a table with schema and path to the server state.
     ///
     /// This is needed for `RESTCatalog::get_table` which requires
@@ -1262,6 +1408,26 @@ impl RESTServer {
         inner.partitions.insert(key.clone(), partitions);
         inner.partition_page_responses.remove(&key);
         inner.partition_list_call_counts.remove(&key);
+    }
+
+    /// Return the specs registered for a table, in registration order.
+    pub fn table_partition_specs(
+        &self,
+        database: &str,
+        table: &str,
+    ) -> Vec<HashMap<String, String>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .partitions
+            .get(&format!("{database}.{table}"))
+            .map(|partitions| {
+                partitions
+                    .iter()
+                    .map(|partition| partition.spec.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Set explicit list-partitions pages and response tokens in request order.
@@ -1448,6 +1614,14 @@ pub async fn start_mock_server(
         .route(
             &format!("{prefix}/databases/:db/tables/:table/partitions/drop"),
             post(RESTServer::drop_partitions),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/partitions/list-by-names"),
+            post(RESTServer::list_partitions_by_names),
+        )
+        .route(
+            &format!("{prefix}/databases/:db/tables/:table/partitions/list-by-filter"),
+            post(RESTServer::list_partitions_by_filter),
         )
         .route(
             &format!("{prefix}/databases/:db/views"),

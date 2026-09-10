@@ -31,7 +31,8 @@ use crate::Result;
 use super::api_request::{
     AlterDatabaseRequest, AlterTableRequest, AuthTableQueryRequest, CreateDatabaseRequest,
     CreateFunctionRequest, CreatePartitionsRequest, CreateTableRequest, CreateViewRequest,
-    DropPartitionsRequest, RenameTableRequest,
+    DropPartitionsRequest, ListPartitionsByFilterRequest, ListPartitionsByNamesRequest,
+    RenameTableRequest,
 };
 use super::api_response::{
     AuthTableQueryResponse, ConfigResponse, GetDatabaseResponse, GetFunctionResponse,
@@ -597,7 +598,7 @@ impl RESTApi {
 
     /// List all partitions of a table, paging internally.
     pub async fn list_partitions(&self, identifier: &Identifier) -> Result<Vec<Partition>> {
-        self.drain_partitions(identifier, None, None).await
+        self.drain_partitions(identifier, None, None, None).await
     }
 
     /// List partitions, asking the catalog to return only those whose partition name
@@ -615,8 +616,79 @@ impl RESTApi {
             identifier,
             Some(Self::PARTITION_REQUEST_SIZE),
             partition_name_pattern,
+            None,
         )
         .await
+    }
+
+    /// List partitions, asking the catalog to return only those matching `filter`, a partition
+    /// predicate in the REST catalog predicate JSON format, together with
+    /// `partition_name_pattern` when one is given.
+    ///
+    /// Like the pattern, the filter is a pushdown hint: a catalog may apply it partially or not
+    /// at all, so callers keep applying their own filter to what comes back.
+    pub async fn list_partitions_by_filter(
+        &self,
+        identifier: &Identifier,
+        filter: &str,
+        partition_name_pattern: Option<&str>,
+    ) -> Result<Vec<Partition>> {
+        self.drain_partitions(
+            identifier,
+            Some(Self::PARTITION_REQUEST_SIZE),
+            partition_name_pattern,
+            Some(filter),
+        )
+        .await
+    }
+
+    /// List one page of partitions matching `filter`. See [`Self::list_partitions_by_filter`].
+    pub async fn list_partitions_by_filter_paged(
+        &self,
+        identifier: &Identifier,
+        filter: &str,
+        max_results: Option<u32>,
+        page_token: Option<&str>,
+        partition_name_pattern: Option<&str>,
+    ) -> Result<PagedList<Partition>> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
+        let path = self
+            .resource_paths
+            .list_partitions_by_filter(database, table);
+        let request = ListPartitionsByFilterRequest::new(
+            filter.to_string(),
+            partition_name_pattern
+                .filter(|pattern| !pattern.is_empty())
+                .map(str::to_string),
+            max_results,
+            page_token.map(str::to_string),
+        );
+        let response: ListPartitionsResponse = self.client.post(&path, &request).await?;
+        Ok(PagedList::new(
+            response.partitions.unwrap_or_default(),
+            response.next_page_token,
+        ))
+    }
+
+    /// Return those of the given complete partition specs that are registered.
+    ///
+    /// The specs go out in one request, so callers bound how many they send at once.
+    pub async fn list_partitions_by_names(
+        &self,
+        identifier: &Identifier,
+        partition_specs: Vec<HashMap<String, String>>,
+    ) -> Result<Vec<Partition>> {
+        let database = identifier.database();
+        let table = identifier.object();
+        validate_non_empty_multi(&[(database, "database name"), (table, "table name")])?;
+        let path = self
+            .resource_paths
+            .list_partitions_by_names(database, table);
+        let request = ListPartitionsByNamesRequest::new(partition_specs);
+        let response: ListPartitionsResponse = self.client.post(&path, &request).await?;
+        Ok(response.partitions.unwrap_or_default())
     }
 
     async fn drain_partitions(
@@ -624,6 +696,7 @@ impl RESTApi {
         identifier: &Identifier,
         max_results: Option<u32>,
         partition_name_pattern: Option<&str>,
+        filter: Option<&str>,
     ) -> Result<Vec<Partition>> {
         let database = identifier.database();
         let table = identifier.object();
@@ -634,14 +707,27 @@ impl RESTApi {
         let mut seen_page_tokens = HashSet::new();
 
         loop {
-            let paged = self
-                .list_partitions_paged(
-                    identifier,
-                    max_results,
-                    page_token.as_deref(),
-                    partition_name_pattern,
-                )
-                .await?;
+            let paged = match filter {
+                Some(filter) => {
+                    self.list_partitions_by_filter_paged(
+                        identifier,
+                        filter,
+                        max_results,
+                        page_token.as_deref(),
+                        partition_name_pattern,
+                    )
+                    .await?
+                }
+                None => {
+                    self.list_partitions_paged(
+                        identifier,
+                        max_results,
+                        page_token.as_deref(),
+                        partition_name_pattern,
+                    )
+                    .await?
+                }
+            };
             results.extend(paged.elements);
 
             let Some(next_page_token) = paged.next_page_token.filter(|token| !token.is_empty())

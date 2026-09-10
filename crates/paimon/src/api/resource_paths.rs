@@ -221,6 +221,22 @@ impl ResourcePaths {
     pub fn drop_partitions(&self, database_name: &str, table_name: &str) -> String {
         format!("{}/drop", self.partitions(database_name, table_name))
     }
+
+    /// Get the endpoint path for looking up table partitions by their specs.
+    pub fn list_partitions_by_names(&self, database_name: &str, table_name: &str) -> String {
+        format!(
+            "{}/list-by-names",
+            self.partitions(database_name, table_name)
+        )
+    }
+
+    /// Get the endpoint path for listing table partitions matching a predicate.
+    pub fn list_partitions_by_filter(&self, database_name: &str, table_name: &str) -> String {
+        format!(
+            "{}/list-by-filter",
+            self.partitions(database_name, table_name)
+        )
+    }
 }
 
 #[cfg(test)]

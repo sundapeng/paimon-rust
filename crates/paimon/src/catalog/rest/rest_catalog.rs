@@ -447,6 +447,19 @@ impl Catalog for RESTCatalog {
         if partition_specs.is_empty() {
             return Ok(());
         }
+        // The endpoint only unregisters metadata. For a Format Table whose catalog owns the
+        // partitions that is the whole drop, and the caller deletes the directories; any other
+        // table would keep its data while the call reported success.
+        let table = self.get_table(identifier).await?;
+        if !table.has_catalog_managed_partitions() {
+            return Err(Error::Unsupported {
+                message: format!(
+                    "Dropping partitions through the REST catalog is supported only for Format \
+                     Tables with catalog-managed partitions, and {} is not one",
+                    identifier.full_name()
+                ),
+            });
+        }
         for batch in partition_specs.chunks(PARTITION_BATCH_SIZE) {
             self.api
                 .drop_partitions(identifier, batch.to_vec(), true)
@@ -454,6 +467,40 @@ impl Catalog for RESTCatalog {
                 .map_err(|error| map_rest_error_for_partition_request(error, identifier))?;
         }
         Ok(())
+    }
+
+    async fn list_partitions_by_names(
+        &self,
+        identifier: &Identifier,
+        partition_specs: Vec<HashMap<String, String>>,
+    ) -> Result<Vec<Partition>> {
+        let mut partitions = Vec::new();
+        for batch in partition_specs.chunks(PARTITION_BATCH_SIZE) {
+            match self
+                .api
+                .list_partitions_by_names(identifier, batch.to_vec())
+                .await
+            {
+                Ok(found) => partitions.extend(found),
+                Err(
+                    error @ Error::RestApi {
+                        source: RestError::NotImplemented { .. },
+                    },
+                ) => {
+                    let table = self.get_table(identifier).await?;
+                    if table.has_catalog_managed_partitions() {
+                        return Err(error);
+                    }
+                    return Ok(list_partitions_from_file_system(&table)
+                        .await?
+                        .into_iter()
+                        .filter(|partition| partition_specs.contains(&partition.spec))
+                        .collect());
+                }
+                Err(error) => return Err(map_rest_error_for_table(error, identifier)),
+            }
+        }
+        Ok(partitions)
     }
 
     async fn list_partitions(&self, identifier: &Identifier) -> Result<Vec<Partition>> {

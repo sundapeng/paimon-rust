@@ -46,6 +46,9 @@ pub(crate) const METASTORE_PARTITIONED_TABLE_OPTION: &str = "metastore.partition
 pub(crate) const FORMAT_TABLE_IMPLEMENTATION_OPTION: &str = "format-table.implementation";
 pub(crate) const FORMAT_TABLE_PARTITION_PATH_ONLY_VALUE_OPTION: &str =
     "format-table.partition-path-only-value";
+const FORMAT_TABLE_SCAN_LIST_PARALLELISM_OPTION: &str = "format-table.scan.list-parallelism";
+const DEFAULT_FORMAT_TABLE_SCAN_LIST_PARALLELISM: usize = 64;
+const MAX_FORMAT_TABLE_SCAN_LIST_PARALLELISM: i64 = 1000;
 pub(crate) const BUCKET_KEY_OPTION: &str = "bucket-key";
 const BUCKET_FUNCTION_TYPE_OPTION: &str = "bucket-function.type";
 const BUCKET_OPTION: &str = "bucket";
@@ -656,6 +659,17 @@ impl<'a> CoreOptions<'a> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_DIFF_PARALLELISM)
             .max(1)
+    }
+
+    /// How many partition directories a Format Table scan lists at once (`format-table.scan.list-parallelism`).
+    ///
+    /// Default is 64; values are clamped to `[1, 1000]`, as Java clamps them.
+    pub fn format_table_scan_list_parallelism(&self) -> usize {
+        self.options
+            .get(FORMAT_TABLE_SCAN_LIST_PARALLELISM_OPTION)
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .map(|value| value.clamp(1, MAX_FORMAT_TABLE_SCAN_LIST_PARALLELISM) as usize)
+            .unwrap_or(DEFAULT_FORMAT_TABLE_SCAN_LIST_PARALLELISM)
     }
 
     pub fn data_evolution_enabled(&self) -> bool {
@@ -2319,6 +2333,28 @@ mod tests {
         assert!(CoreOptions::new(&options)
             .partitioned_table_in_metastore()
             .unwrap());
+    }
+
+    #[test]
+    fn test_format_table_scan_list_parallelism() {
+        let parallelism = |value: Option<&str>| {
+            let options = value
+                .map(|value| {
+                    HashMap::from([(
+                        FORMAT_TABLE_SCAN_LIST_PARALLELISM_OPTION.to_string(),
+                        value.to_string(),
+                    )])
+                })
+                .unwrap_or_default();
+            CoreOptions::new(&options).format_table_scan_list_parallelism()
+        };
+
+        assert_eq!(parallelism(None), 64);
+        assert_eq!(parallelism(Some("8")), 8);
+        assert_eq!(parallelism(Some("0")), 1);
+        assert_eq!(parallelism(Some("-3")), 1);
+        assert_eq!(parallelism(Some("5000")), 1000);
+        assert_eq!(parallelism(Some("many")), 64);
     }
 
     #[test]

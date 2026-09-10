@@ -19,16 +19,20 @@
 
 use std::collections::{HashMap, HashSet};
 
+use futures::{StreamExt, TryStreamExt};
+
 use super::format_partition::{
     format_partition_value, is_storage_not_found, parse_format_partition_value,
     FormatTablePartitionPaths,
 };
 use super::rest_env::LoadedFormatTablePartitionOptions;
 use super::{Plan, RESTEnv, ScanTrace, Table};
+use crate::api::RestError;
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
     escape_path_name, extract_datum, unescape_path_name, BinaryRow, BinaryRowBuilder, CoreOptions,
-    DataField, DataFileMeta, Datum, PartitionComputer, Predicate, PredicateOperator,
+    DataField, DataFileMeta, DataType, Datum, Partition, PartitionComputer, Predicate,
+    PredicateOperator,
 };
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::source::{DataSplitBuilder, RowRange};
@@ -102,27 +106,38 @@ impl<'a> FormatTableScan<'a> {
             .to_string();
 
         let partition_fields = self.table.schema().partition_fields();
-        let mut splits = Vec::new();
-        for scan_root in self.scan_roots(&core_options, &table_path).await? {
-            let statuses = self
-                .list_status_recursive_if_exists(&scan_root.path)
-                .await?;
-            for status in statuses {
-                if let Some(split) = self
-                    .status_to_split(
-                        status,
-                        &table_path,
-                        format_extension,
-                        schema_id,
-                        &partition_fields,
-                        scan_root.partition.clone(),
-                    )
-                    .await?
-                {
-                    splits.push(split);
+        let scan_roots = self.scan_roots(&core_options, &table_path).await?;
+        // A table with many partitions pays one listing per partition, so they run concurrently.
+        // `buffered` keeps the roots in order and stops at the first failure.
+        let table_path = table_path.as_str();
+        let partition_fields = partition_fields.as_slice();
+        let listed: Vec<Vec<crate::DataSplit>> = futures::stream::iter(scan_roots)
+            .map(|scan_root| async move {
+                let statuses = self
+                    .list_status_recursive_if_exists(&scan_root.path)
+                    .await?;
+                let mut splits = Vec::new();
+                for status in statuses {
+                    if let Some(split) = self
+                        .status_to_split(
+                            status,
+                            table_path,
+                            format_extension,
+                            schema_id,
+                            partition_fields,
+                            scan_root.partition.clone(),
+                        )
+                        .await?
+                    {
+                        splits.push(split);
+                    }
                 }
-            }
-        }
+                Ok::<_, crate::Error>(splits)
+            })
+            .buffered(core_options.format_table_scan_list_parallelism())
+            .try_collect()
+            .await?;
+        let mut splits = listed.into_iter().flatten().collect::<Vec<_>>();
 
         splits.sort_by(|left, right| {
             left.bucket_path().cmp(right.bucket_path()).then_with(|| {
@@ -237,19 +252,35 @@ impl<'a> FormatTableScan<'a> {
         // and the local match below still decides what is actually scanned.
         let pattern = match &self.partition_filter {
             Some(filter) => {
-                let leading_values = leading_equality_partition_values(
+                let mut leading_values = leading_equality_partition_values(
                     filter,
                     partition_fields,
                     default_partition_name,
                     core_options.legacy_partition_name(),
                 )?;
+                // A name pattern compares spellings, so it can only stand in for an equality on a
+                // column whose values have one. Repair registers directory values as they are, and
+                // `month=01` or `active=TRUE` would fall out of a pattern built from `month = 1`
+                // or `active = true` before the typed match below ever saw them.
+                let single_spelling = partition_fields
+                    .iter()
+                    .take_while(|field| {
+                        matches!(field.data_type(), DataType::Char(_) | DataType::VarChar(_))
+                    })
+                    .count();
+                leading_values.truncate(single_spelling);
                 partition_paths.name_prefix_pattern(&leading_values)
             }
             None => None,
         };
-        let partitions = rest_env
-            .api()
-            .list_partitions_by_name_pattern(rest_env.identifier(), pattern.as_deref())
+        let filter = match &self.partition_filter {
+            Some(PartitionFilter::Predicate(predicate)) => {
+                partition_filter_json(predicate).map(|filter| filter.to_string())
+            }
+            _ => None,
+        };
+        let partitions = self
+            .list_catalog_partitions(rest_env, pattern.as_deref(), filter.as_deref())
             .await?;
         let mut seen_paths = HashSet::with_capacity(partitions.len());
         let mut roots = Vec::with_capacity(partitions.len());
@@ -274,6 +305,33 @@ impl<'a> FormatTableScan<'a> {
         }
         roots.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(roots)
+    }
+
+    /// The registered partitions the catalog returns for this scan's pushdown hints.
+    ///
+    /// A catalog that cannot list by filter is still asked by pattern, so the catalog stays the
+    /// source of the partition set; the typed match on the result decides what is scanned.
+    async fn list_catalog_partitions(
+        &self,
+        rest_env: &RESTEnv,
+        pattern: Option<&str>,
+        filter: Option<&str>,
+    ) -> crate::Result<Vec<Partition>> {
+        let api = rest_env.api();
+        let identifier = rest_env.identifier();
+        if let Some(filter) = filter {
+            match api
+                .list_partitions_by_filter(identifier, filter, pattern)
+                .await
+            {
+                Err(crate::Error::RestApi {
+                    source: RestError::NotImplemented { .. },
+                }) => {}
+                result => return result,
+            }
+        }
+        api.list_partitions_by_name_pattern(identifier, pattern)
+            .await
     }
 
     fn invalid_catalog_partition_metadata(&self, source: crate::Error) -> crate::Error {
@@ -447,6 +505,32 @@ fn leading_equality_partition_path(
         })
         .collect::<Vec<_>>();
     Some(join_path(table_path, &segments.join("/")))
+}
+
+/// The part of a partition predicate that can be sent to the catalog as a filter.
+///
+/// An AND keeps the children that have a wire form, since leaving out a conjunct only widens
+/// what the catalog may return; anything else is sent whole or not at all. Nothing is sent for a
+/// predicate that selects everything.
+///
+/// Mirrors Java `FormatTableScan.extractPartitionPredicate`.
+fn partition_filter_json(predicate: &Predicate) -> Option<serde_json::Value> {
+    match predicate {
+        Predicate::AlwaysTrue => None,
+        Predicate::And(children) => {
+            let mut pushed = children
+                .iter()
+                .filter(|child| child.to_rest_json().is_some())
+                .cloned()
+                .collect::<Vec<_>>();
+            match pushed.len() {
+                0 => None,
+                1 => pushed.pop().and_then(|child| child.to_rest_json()),
+                _ => Predicate::And(pushed).to_rest_json(),
+            }
+        }
+        other => other.to_rest_json(),
+    }
 }
 
 /// The leading run of partition values this filter pins to a single value, in
@@ -769,5 +853,45 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn test_partition_filter_json_sends_what_can_only_widen_the_result() {
+        use crate::spec::{DateType, IntType, PredicateBuilder, VarCharType};
+
+        let fields = vec![
+            DataField::new(
+                0,
+                "dt".to_string(),
+                DataType::VarChar(VarCharType::default()),
+            ),
+            DataField::new(1, "hh".to_string(), DataType::Int(IntType::new())),
+            DataField::new(2, "day".to_string(), DataType::Date(DateType::new())),
+        ];
+        let builder = PredicateBuilder::new(&fields);
+        let dt = builder.equal("dt", Datum::String("a".to_string())).unwrap();
+        let hh = builder.greater_than("hh", Datum::Int(10)).unwrap();
+        let day = builder.equal("day", Datum::Date(20_656)).unwrap();
+        let sent = |predicate: &Predicate| {
+            partition_filter_json(predicate).map(|json| {
+                Predicate::from_rest_json(&json.to_string(), &fields)
+                    .unwrap()
+                    .to_string()
+            })
+        };
+
+        // A DATE literal has no wire form, so the AND goes without it.
+        assert_eq!(
+            sent(&Predicate::and(vec![dt.clone(), hh.clone(), day.clone()])),
+            Some(Predicate::and(vec![dt.clone(), hh]).to_string())
+        );
+        assert_eq!(
+            sent(&Predicate::and(vec![dt.clone(), day.clone()])),
+            Some(dt.to_string())
+        );
+        // Leaving out a child of an OR would narrow it, so it is sent whole or not at all.
+        assert_eq!(sent(&Predicate::or(vec![dt.clone(), day])), None);
+        assert_eq!(sent(&Predicate::Not(Box::new(dt))), None);
+        assert_eq!(sent(&Predicate::AlwaysTrue), None);
     }
 }

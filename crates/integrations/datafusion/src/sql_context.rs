@@ -2073,25 +2073,24 @@ impl SQLContext {
         for (expressions, ignore_if_not_exists) in requests {
             let spec =
                 parse_format_partition_spec(expressions, table, false, enable_ident_normalization)?;
-            let normalized = normalize_catalog_partition_spec(&spec, table, false)?;
-            requested.push((
-                spec.len() == partition_key_count,
-                spec,
-                normalized,
-                *ignore_if_not_exists,
-            ));
+            requested.push((spec, *ignore_if_not_exists));
         }
 
-        let registered = catalog
-            .list_partitions(identifier)
-            .await
-            .map_err(to_datafusion_error)?
-            .into_iter()
-            .map(|partition| {
-                let normalized = normalize_catalog_partition_spec(&partition.spec, table, true)?;
-                Ok((partition.spec, normalized))
-            })
-            .collect::<DFResult<Vec<_>>>()?;
+        // Only a partial specification needs the whole registry; complete ones are looked up by
+        // name, which keeps the common exact drop from reading every registration.
+        let complete_specs = requested
+            .iter()
+            .filter(|(spec, _)| spec.len() == partition_key_count)
+            .map(|(spec, _)| spec.clone())
+            .collect::<Vec<_>>();
+        let registered = if complete_specs.len() == requested.len() {
+            catalog
+                .list_partitions_by_names(identifier, complete_specs)
+                .await
+        } else {
+            catalog.list_partitions(identifier).await
+        }
+        .map_err(to_datafusion_error)?;
 
         let core_options = CoreOptions::new(table.schema().options());
         let partition_paths = FormatTablePartitionPaths::new(
@@ -2099,45 +2098,41 @@ impl SQLContext {
             core_options.format_table_partition_only_value_in_path(),
         );
         let table_path = table.location().trim_end_matches('/');
+        // Every directory is resolved before the first mutation, so a registration that cannot
+        // be turned into a path fails the statement as a whole.
+        let registered = registered
+            .into_iter()
+            .map(|partition| {
+                let relative_path = partition_paths
+                    .relative_path(&partition.spec)
+                    .map_err(to_datafusion_error)?;
+                Ok((partition.spec, format!("{table_path}/{relative_path}")))
+            })
+            .collect::<DFResult<Vec<_>>>()?;
+
         let mut selected: Vec<(HashMap<String, String>, String)> = Vec::new();
         let mut selected_paths = HashSet::new();
-        for (complete, spec, normalized, ignore_if_not_exists) in &requested {
-            // A specification that is registered verbatim drops exactly that registration,
-            // so catalog values that only differ before normalization stay distinguishable.
-            let verbatim = registered.iter().any(|(registered, _)| registered == spec);
-            let mut matches = 0usize;
-            for (registered_spec, registered_normalized) in &registered {
-                let selects = if verbatim {
-                    registered_spec == spec
-                } else {
-                    normalized
-                        .iter()
-                        .all(|(key, value)| registered_normalized.get(key) == Some(value))
-                };
-                if !selects {
+        for (spec, ignore_if_not_exists) in &requested {
+            // Values are compared as the catalog holds them. A request is spelled the way ADD
+            // PARTITION writes it, while repair registers the directory spelling, so a partition
+            // registered as `month=01` is not the partition `month = 1` names.
+            let mut matched = false;
+            for (registered_spec, path) in &registered {
+                if !spec
+                    .iter()
+                    .all(|(key, value)| registered_spec.get(key) == Some(value))
+                {
                     continue;
                 }
-                matches += 1;
-                // Every directory is resolved before the first mutation, so a specification
-                // that cannot be turned into a path fails the statement as a whole.
-                let relative_path = partition_paths
-                    .relative_path(registered_spec)
-                    .map_err(to_datafusion_error)?;
-                let path = format!("{table_path}/{relative_path}");
+                matched = true;
                 if selected_paths.insert(path.clone()) {
-                    selected.push((registered_spec.clone(), path));
+                    selected.push((registered_spec.clone(), path.clone()));
                 }
-            }
-            if *complete && !verbatim && matches > 1 {
-                return Err(DataFusionError::Plan(format!(
-                    "Partition {spec:?} matches multiple catalog registrations in table {}; use an exact catalog value",
-                    identifier.full_name()
-                )));
             }
             // Only a complete specification names one partition, so only it can be
             // reported as missing. A partial one describes a set that is allowed to be
             // empty, which is how Java reads it too.
-            if matches == 0 && *complete && !ignore_if_not_exists {
+            if !matched && spec.len() == partition_key_count && !ignore_if_not_exists {
                 return Err(DataFusionError::Plan(format!(
                     "Partition {spec:?} does not exist in table {}",
                     identifier.full_name()

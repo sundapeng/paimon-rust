@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType as ArrowDataType, Field, Schema as ArrowSchema};
+use axum::http::StatusCode;
 use paimon::api::ConfigResponse;
 use paimon::catalog::RESTCatalog;
 use paimon::spec::{BigIntType, BooleanType, DataType, DateType, IntType, Schema, VarCharType};
@@ -346,9 +347,7 @@ async fn test_catalog_managed_scan_pushes_a_partition_name_pattern() {
         ("hh = '10'", None),
         ("dt > '20260722'", None),
     ] {
-        let seen = server
-            .table_partition_list_name_patterns(DATABASE, TABLE)
-            .len();
+        let seen = listing_counts(&server);
         context
             .sql(&format!(
                 "SELECT * FROM paimon.default.events WHERE {predicate}"
@@ -358,14 +357,117 @@ async fn test_catalog_managed_scan_pushes_a_partition_name_pattern() {
             .collect()
             .await
             .unwrap();
-        let patterns = server.table_partition_list_name_patterns(DATABASE, TABLE);
-        let pushed = &patterns[seen..];
+        let pushed = name_patterns_since(&server, seen);
         assert!(!pushed.is_empty(), "{predicate} listed no partitions");
         assert!(
             pushed.iter().all(|pattern| pattern.as_deref() == expected),
             "{predicate} pushed {pushed:?}, expected {expected:?}"
         );
     }
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_catalog_managed_scan_sends_its_partition_predicate_as_a_filter() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let schema = format_table_schema(&[
+        ("dt", DataType::VarChar(VarCharType::new(255).unwrap())),
+        ("hh", DataType::VarChar(VarCharType::new(255).unwrap())),
+    ]);
+    let (server, context) = setup_rest_table(&temp_dir, schema).await;
+    for (dt, hh, id) in [
+        ("20260722", "10", 1),
+        ("20260722", "11", 2),
+        ("20260723", "10", 3),
+    ] {
+        write_ids(&temp_dir.path().join(format!("dt={dt}/hh={hh}")), &[id]);
+    }
+    add_partitions(
+        &context,
+        &[("20260722", "10"), ("20260722", "11"), ("20260723", "10")],
+    )
+    .await;
+
+    // No leading equality, so only the filter can narrow what the catalog returns.
+    assert_eq!(
+        ids(
+            &context,
+            "SELECT id FROM paimon.default.events WHERE hh = '10'"
+        )
+        .await,
+        vec![1, 3]
+    );
+    let requests = server.table_partition_list_by_filter_requests(DATABASE, TABLE);
+    let request = requests.last().expect("the scan should list by filter");
+    assert_eq!(request.partition_name_pattern, None);
+    assert_eq!(request.max_results, Some(1000));
+    let filter: serde_json::Value = serde_json::from_str(&request.filter).unwrap();
+    assert_eq!(filter["function"], "EQUAL");
+    assert_eq!(filter["transform"]["fieldRef"]["name"], "hh");
+    assert_eq!(filter["transform"]["fieldRef"]["index"], 1);
+    assert_eq!(filter["literals"], serde_json::json!(["10"]));
+
+    // A catalog that cannot list by filter is still asked, by pattern; the partition set never
+    // comes from the directory tree.
+    server.set_list_partitions_by_filter_error_status(Some(StatusCode::NOT_IMPLEMENTED));
+    let listed = server
+        .table_partition_list_name_patterns(DATABASE, TABLE)
+        .len();
+    assert_eq!(
+        ids(
+            &context,
+            "SELECT id FROM paimon.default.events WHERE dt = '20260722' AND hh > '10'"
+        )
+        .await,
+        vec![2]
+    );
+    assert_eq!(
+        server.table_partition_list_name_patterns(DATABASE, TABLE)[listed..],
+        [Some("dt=20260722/%".to_string())]
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_catalog_managed_scan_keeps_registrations_spelled_unlike_the_filter() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let schema = format_table_schema(&[
+        ("month", DataType::Int(IntType::new())),
+        ("active", DataType::Boolean(BooleanType::new())),
+    ]);
+    let (server, context) = setup_rest_table(&temp_dir, schema).await;
+    // Repair registers directory values as they are, so the catalog can hold spellings that a
+    // typed literal never formats to.
+    write_ids(&temp_dir.path().join("month=01/active=TRUE"), &[1]);
+    write_ids(&temp_dir.path().join("month=2/active=false"), &[2]);
+    server.set_table_partitions(
+        DATABASE,
+        TABLE,
+        vec![
+            spec(&[("month", "01"), ("active", "TRUE")]),
+            spec(&[("month", "2"), ("active", "false")]),
+        ],
+    );
+
+    for (predicate, expected) in [
+        ("month = 1", vec![1]),
+        ("month = 1 AND active = true", vec![1]),
+        ("month = 2 AND active = false", vec![2]),
+    ] {
+        assert_eq!(
+            ids(
+                &context,
+                &format!("SELECT id FROM paimon.default.events WHERE {predicate}")
+            )
+            .await,
+            expected,
+            "{predicate}"
+        );
+    }
+    // A pattern built from `month = 1` would have dropped `month=01` on the catalog side.
+    assert!(name_patterns_since(&server, (0, 0))
+        .iter()
+        .all(Option::is_none));
 }
 
 #[cfg(not(windows))]
@@ -410,6 +512,123 @@ async fn test_format_table_filter_on_a_partition_column_reads_the_directory_valu
     }
 }
 
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_drop_partition_matches_values_as_the_catalog_holds_them() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let schema = format_table_schema(&[
+        ("year", DataType::VarChar(VarCharType::new(255).unwrap())),
+        ("month", DataType::Int(IntType::new())),
+    ]);
+    let (server, context) = setup_rest_table(&temp_dir, schema).await;
+    // Repair keeps directory spellings, so both registrations are legitimate and distinct.
+    for directory in ["year=2025/month=01", "year=2026/month=1"] {
+        std::fs::create_dir_all(temp_dir.path().join(directory)).unwrap();
+    }
+    server.set_table_partitions(
+        DATABASE,
+        TABLE,
+        vec![
+            spec(&[("year", "2025"), ("month", "01")]),
+            spec(&[("year", "2026"), ("month", "1")]),
+        ],
+    );
+
+    // A request is spelled the way ADD PARTITION registers it, so `month = 1` is not `month=01`.
+    let error = context
+        .sql("ALTER TABLE paimon.default.events DROP PARTITION (year = '2025', month = 1)")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("does not exist"), "{error}");
+    context
+        .sql(
+            "ALTER TABLE paimon.default.events DROP IF EXISTS PARTITION (year = '2025', month = 1)",
+        )
+        .await
+        .unwrap();
+
+    context
+        .sql("ALTER TABLE paimon.default.events DROP PARTITION (month = 1)")
+        .await
+        .unwrap();
+    assert_eq!(
+        server.table_partition_specs(DATABASE, TABLE),
+        vec![spec(&[("year", "2025"), ("month", "01")])]
+    );
+    assert_partition_directories(
+        &temp_dir,
+        &[("year=2025/month=01", true), ("year=2026/month=1", false)],
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_drop_partition_looks_up_complete_specifications_by_name() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let schema = format_table_schema(&[
+        ("dt", DataType::VarChar(VarCharType::new(255).unwrap())),
+        ("hh", DataType::VarChar(VarCharType::new(255).unwrap())),
+    ]);
+    let (server, context) = setup_rest_table(&temp_dir, schema).await;
+    add_partitions(
+        &context,
+        &[("20260722", "10"), ("20260722", "11"), ("20260723", "10")],
+    )
+    .await;
+    let listings = server
+        .table_partition_list_name_patterns(DATABASE, TABLE)
+        .len();
+
+    context
+        .sql(
+            "ALTER TABLE paimon.default.events \
+             DROP PARTITION (dt = '20260722', hh = '10'), DROP PARTITION (dt = '20260723', hh = '10')",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        server
+            .table_partition_list_name_patterns(DATABASE, TABLE)
+            .len(),
+        listings,
+        "complete specifications should not read the registry"
+    );
+    assert_eq!(
+        server.table_partition_list_by_names_calls(DATABASE, TABLE),
+        vec![vec![
+            spec(&[("dt", "20260722"), ("hh", "10")]),
+            spec(&[("dt", "20260723"), ("hh", "10")]),
+        ]]
+    );
+
+    // A partial specification needs the registry, and reads it once.
+    context
+        .sql("ALTER TABLE paimon.default.events DROP PARTITION (dt = '20260722')")
+        .await
+        .unwrap();
+    assert_eq!(
+        server
+            .table_partition_list_name_patterns(DATABASE, TABLE)
+            .len(),
+        listings + 1
+    );
+    assert_eq!(
+        server
+            .table_partition_list_by_names_calls(DATABASE, TABLE)
+            .len(),
+        1
+    );
+    assert!(server.table_partition_specs(DATABASE, TABLE).is_empty());
+}
+
+fn spec(values: &[(&str, &str)]) -> HashMap<String, String> {
+    values
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect()
+}
+
 fn write_ids(directory: &Path, ids: &[i64]) {
     std::fs::create_dir_all(directory).unwrap();
     let schema = Arc::new(ArrowSchema::new(vec![Field::new(
@@ -440,6 +659,33 @@ async fn ids(context: &SQLContext, sql: &str) -> Vec<i64> {
     }
     ids.sort_unstable();
     ids
+}
+
+/// How many listings the table has received from each endpoint: plain, then by filter.
+fn listing_counts(server: &RESTServer) -> (usize, usize) {
+    (
+        server
+            .table_partition_list_name_patterns(DATABASE, TABLE)
+            .len(),
+        server
+            .table_partition_list_by_filter_requests(DATABASE, TABLE)
+            .len(),
+    )
+}
+
+/// The name patterns of the listings received since `seen`, whichever endpoint served them.
+fn name_patterns_since(server: &RESTServer, seen: (usize, usize)) -> Vec<Option<String>> {
+    let mut patterns = server
+        .table_partition_list_name_patterns(DATABASE, TABLE)
+        .split_off(seen.0);
+    patterns.extend(
+        server
+            .table_partition_list_by_filter_requests(DATABASE, TABLE)
+            .into_iter()
+            .skip(seen.1)
+            .map(|request| request.partition_name_pattern),
+    );
+    patterns
 }
 
 async fn add_partitions(context: &SQLContext, partitions: &[(&str, &str)]) {

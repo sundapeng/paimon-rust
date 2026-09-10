@@ -592,6 +592,27 @@ pub trait Catalog: Send + Sync {
         })
     }
 
+    /// Return those of the given complete partition specs that are registered.
+    ///
+    /// Specs are compared with the registered values as they are, without normalizing them.
+    /// The default impl filters [`Self::list_partitions`]; catalogs that can look partitions up
+    /// by name (e.g. `RESTCatalog`) override it so a few specs never cost a full listing.
+    async fn list_partitions_by_names(
+        &self,
+        identifier: &Identifier,
+        partition_specs: Vec<HashMap<String, String>>,
+    ) -> Result<Vec<Partition>> {
+        if partition_specs.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .list_partitions(identifier)
+            .await?
+            .into_iter()
+            .filter(|partition| partition_specs.contains(&partition.spec))
+            .collect())
+    }
+
     /// List partitions for a table.
     ///
     /// Default impl scans the table's manifest entries via
