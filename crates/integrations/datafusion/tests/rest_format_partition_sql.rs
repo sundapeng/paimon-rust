@@ -521,6 +521,45 @@ async fn test_msck_repair_reconciles_registrations_with_directories() {
 
 #[cfg(not(windows))]
 #[tokio::test]
+async fn test_msck_repair_refuses_to_drop_without_a_table_directory() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (server, context) =
+        setup_rest_table(&temp_dir, format_table_schema(&[("dt", varchar())])).await;
+    common::exec(
+        &context,
+        &format!("ALTER TABLE {TABLE_NAME} ADD PARTITION (dt = 'a')"),
+    )
+    .await;
+
+    // A moved root must not read as every partition directory gone.
+    let moved_dir = tempfile::tempdir().unwrap();
+    std::fs::rename(temp_dir.path(), moved_dir.path().join("events")).unwrap();
+    for action in ["DROP", "SYNC"] {
+        common::assert_sql_error(
+            &context,
+            &format!("MSCK REPAIR TABLE {TABLE_NAME} {action} PARTITIONS"),
+            "does not exist",
+        )
+        .await;
+    }
+
+    std::fs::write(temp_dir.path(), b"").unwrap();
+    for action in ["DROP", "SYNC"] {
+        common::assert_sql_error(
+            &context,
+            &format!("MSCK REPAIR TABLE {TABLE_NAME} {action} PARTITIONS"),
+            "is not a directory",
+        )
+        .await;
+    }
+    assert_eq!(
+        server.table_partition_specs(DATABASE, TABLE),
+        vec![spec(&[("dt", "a")])]
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
 async fn test_msck_repair_keeps_a_partition_at_a_custom_location() {
     let temp_dir = tempfile::tempdir().unwrap();
     let external_dir = tempfile::tempdir().unwrap();

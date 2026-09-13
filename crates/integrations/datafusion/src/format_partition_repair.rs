@@ -75,9 +75,8 @@ async fn repair(
     let table_path = table.location();
 
     if matches!(mode, RepairMode::Drop | RepairMode::Sync) {
-        // Discovery treats a missing root as empty. Destructive repair must fail
-        // instead, or it could unregister every catalog partition.
-        table.file_io().list_status(table_path).await?;
+        // Discovery reads a missing root as empty, which would unregister every partition.
+        ensure_table_root_is_directory(table).await?;
     }
 
     // Load both views before changing catalog metadata so a listing failure leaves
@@ -142,6 +141,31 @@ async fn repair(
         catalog.drop_partitions(identifier, to_unregister).await?;
     }
     Ok(())
+}
+
+/// Fail unless the table root is a directory; on object stores, a root holding objects counts.
+async fn ensure_table_root_is_directory(table: &Table) -> paimon::Result<()> {
+    let file_io = table.file_io();
+    let root = table.location();
+    let problem = match file_io.get_status(root).await {
+        Ok(status) if status.is_dir => return Ok(()),
+        Ok(_) => "is not a directory",
+        // A store without directory entries cannot stat the root but lists what it holds.
+        Err(_) => {
+            if !file_io.list_status(root).await?.is_empty() {
+                return Ok(());
+            }
+            "does not exist"
+        }
+    };
+    Err(paimon::Error::DataInvalid {
+        message: format!(
+            "MSCK REPAIR TABLE cannot drop partitions of Format Table {}: \
+             its location {root} {problem}",
+            table.identifier().full_name()
+        ),
+        source: None,
+    })
 }
 
 fn index_specs_by_name(
